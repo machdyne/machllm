@@ -1,7 +1,7 @@
 # machllm
 
 **A language model computer on an FPGA.** machllm is a system-on-chip
-for Machdyne's ECP5 boards that does one thing: run a language model,
+for Machdyne FPGA computers that does one thing: run a language model,
 entirely in our own open gateware and firmware, offline.
 
 ![machllm architecture](docs/img/architecture.svg)
