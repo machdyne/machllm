@@ -16,6 +16,9 @@
 #include <cstring>
 #include <string>
 #include "Vmlm_soc.h"
+#ifdef TB_UI
+#include "Vmlm_soc___024root.h"
+#endif
 #include "svdpi.h"
 #include "verilated.h"
 #include "../sd/sdcard_model.h"
@@ -143,6 +146,20 @@ int main(int argc, char **argv)
 		} else if (phase == 4 && out.size() > mark + 4 && out.compare(out.size() - 2, 2, "> ") == 0) {
 			fprintf(stderr, "\n[tb_soc: done after %llu cycles, %llu card blocks]\n",
 			        (unsigned long long)cycles, (unsigned long long)card.blocks);
+#ifdef TB_UI
+			{	/* the screen's cells: one line a row, the colour digit before each character */
+				FILE *f = fopen("ui_screen.txt", "w");
+				for (int r = 0; r < 25; r++) {
+					for (int c = 0; c < 80; c++) {
+						unsigned v = top->rootp->mlm_soc__DOT__g_ui__DOT__ui__DOT__cells[r * 80 + c];
+						fprintf(f, "%u%c", (v >> 7) & 3, (v & 127) == 127 ? '@' : (v & 127) < 32 ? ' ' : (int)(v & 127));
+					}
+					fprintf(f, "\n");
+				}
+				fprintf(f, "ROWBG %07x\n", (unsigned)top->rootp->mlm_soc__DOT__g_ui__DOT__ui__DOT__rowbg);
+				fclose(f);
+			}
+#endif
 			if (card.errors) {
 				fprintf(stderr, "[tb_soc: SD CARD MODEL ERRORS: %d]\n", card.errors);
 				return 5;

@@ -10,6 +10,7 @@
  (RV32IM)      +-- SYSCTL                  +-- ENGINE + GLU unit -- sq/sd: stream ----+--> mlm_ddr3
                +-- UART (1M 8N1)           +-- DDR3 registers (training)              |   (controller
                +-- vector unit             +-- MAIN 512 MB (CPU word path) -----------+    + PHY)
+               +-- screen + keyboard (pixel clock 25.2 MHz, TMDS 126 MHz, USB 12 MHz)
                +-- read line (16 B) <== handshake ==> (one access at a time)
                +-- result mirror 8 KB  <== dual-clock RAM ==  engine copy-out
                +-- input staging 4 KB  == dual-clock RAM ==>  engine copy-in (X)
@@ -37,6 +38,7 @@ domain, 48 MHz). See [usage.md](usage.md).
 | 0x7300_0000 | VU | vector unit, see [vu.md](vu.md) |
 | 0x7400_0000 | MIRROR | 8 KB: engine results copied out (`ENG_CO_*`), read like RAM |
 | 0x7500_0000 | XSTAGE | 4 KB: the next engine input, copied in (`ENG_CI_GO`) |
+| 0x7600_0000 | UI | the screen's 2,000 cells, ID "UI01", ROWBG, the keyboard (`rtl/mlm_ui.v`; `UI=1`) |
 | 0x8000_0000 | ENGINE | see [engine.md](engine.md) |
 
 The CPU's port takes a request every cycle for the RAM, the mirror and
@@ -58,19 +60,23 @@ answers (~20 CPU cycles across the crossing).
 
 ## Resources (Sergei ML2, LFE5U-45F)
 
-Build of 2026-11-27 (a4ed4c0), `make MEM_MHZ=75`:
+`make MEM_MHZ=90` with the screen and keyboard (the default, `UI=1`):
 
 | | Used | Of | |
 |---|---|---|---|
-| LUT4 (TRELLIS_COMB) | 31,776 | 43,848 | 72% |
-| block RAM (DP16KD) | 105 | 108 | 97% |
+| LUT4 (TRELLIS_COMB) | 33,779 | 43,848 | 77% |
+| flip-flops (TRELLIS_FF) | 14,448 | 43,848 | 32% |
+| block RAM (DP16KD) | 106 | 108 | 98% |
 | multipliers (MULT18X18D) | 24 | 72 | 33% |
 
 Block RAM: firmware RAM 48, the engine's output memory, input memory
 (16 narrow banks), the result mirror and input staging, the sigmoid
 table, the controller and SD buffers. Block RAM is the scarce resource
-now: a text terminal and keyboard will need some of it
-back (the output memory and mirror are the candidates).
+now. The screen and keyboard (`UI=1`) take one: the 80 x 25 cells (9
+bits each: a 7-bit character and a 2-bit colour) fill one 2048 x 9
+block RAM; the 8x16 font and the USB core's ROM are in logic. They add
+~2,000 LUTs and two clocks (a second PLL for 25.2 / 126 MHz; 12 MHz for
+USB from the first), and nothing to the memory side.
 
 The multipliers (`rtl/mlm_mul18s.v`, `rtl/mlm_mul16r.v`) are plain
 Verilog that Yosys maps to DSP blocks without their own registers;
@@ -85,6 +91,7 @@ board (bonsai-v1 to v4) while every simulation passed.
 | `rtl/mlm_soc.v` | the system |
 | `rtl/mlm_engine.v` | matrix-vector engine and GLU unit |
 | `rtl/mlm_vu.v` | vector unit |
+| `rtl/mlm_ui.v`, `rtl/mlm_font8x16.hex`, `rtl/mlm_hid_rom.v`, `rtl/mem/mlm_vpll.v` | screen (text mode, TMDS) and keyboard (nand2mario's usb_hid_host from Zeitlos's `rtl/ext`) |
 | `rtl/mlm_mul18s.v`, `rtl/mlm_mul16r.v` | DSP multipliers (signed 18x18, unsigned 16x16) |
 | `rtl/mem/mlm_ddr3.v`, `mlm_ddr3_ctrl.v` | DDR3 (forked from Zeitlos) |
 | `rtl/mem/mlm_ddr3_clk.v`, `mlm_pll.v` | DDR3 clocking (Zeitlos's, with the clock as a parameter) |

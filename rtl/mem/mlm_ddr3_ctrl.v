@@ -555,17 +555,29 @@ module mlm_ddr3_ctrl #(
 	// Cycles until each bank may be activated again. Set by an
 	// ACTIVATE (tRC) and by a READ with auto-precharge (tRTP + tRP).
 	reg [3:0] bank_cnt [0:(1<<BANK_BITS)-1];
+	// bfree[b] == (bank_cnt[b] == 0), kept as a register: every write
+	// of bank_cnt writes it too (a constant's zero test, or cnt <= 1 for
+	// the count-down), so the "free" the stream's decisions read is one
+	// flip-flop rather than a 4-bit compare (the DDR3-180 critical loop:
+	// counter, compare, bank select, the decision, the counter)
+	reg [(1<<BANK_BITS)-1:0] bfree;
 	reg bank_set;
 	reg [BANK_BITS-1:0] bank_set_b;
 	reg [3:0] bank_set_v;
 	wire st_bank_free;
 	reg all_idle;
 	integer bi;
-	always @(*) begin
-		all_idle = 1'b1;
-		for (bi = 0; bi < (1 << BANK_BITS); bi = bi + 1)
-			if (bank_cnt[bi] != 4'd0) all_idle = 1'b0;
-	end
+	always @(*) all_idle = &bfree;
+`ifndef SYNTHESIS
+	// the invariant, checked every cycle in simulation
+	integer bc;
+	always @(posedge clk_i)
+		for (bc = 0; bc < (1 << BANK_BITS); bc = bc + 1)
+			if (!rst_i && bfree[bc] != (bank_cnt[bc] == 4'd0)) begin
+				$display("mlm_ddr3_ctrl: bfree[%0d] = %0d but bank_cnt = %0d", bc, bfree[bc], bank_cnt[bc]);
+				$stop;
+			end
+`endif
 
 	integer i;
 
@@ -582,7 +594,7 @@ module mlm_ddr3_ctrl #(
 	wire [(1<<BANK_BITS)-1:0] bank_z;
 	genvar gz;
 	generate for (gz = 0; gz < (1 << BANK_BITS); gz = gz + 1) begin : g_bz
-		assign bank_z[gz] = (bank_cnt[gz] == 4'd0);
+		assign bank_z[gz] = bfree[gz];
 	end endgenerate
 	wire [BANK_BITS-1:0] st_b1 = st_bank + 1'b1, st_b2 = st_bank + 2'd2;
 	wire st_z1 = bank_z[st_b1], st_z2 = bank_z[st_b2];
@@ -888,6 +900,7 @@ module mlm_ddr3_ctrl #(
 			st_pre <= 1'b0;
 			for (i = 0; i < (1 << BANK_BITS); i = i + 1)
 				bank_cnt[i] <= 4'd0;
+			bfree <= {(1<<BANK_BITS){1'b1}};
 		end else begin
 
 			// Defaults. Every command output falls back to DESELECT
@@ -915,8 +928,10 @@ module mlm_ddr3_ctrl #(
 			end
 			st_out <= st_out + ((soh[S_ST_RD]) ? 6'd1 : 6'd0)
 			                 - ((phy_rvalid_i && st_out != 6'd0) ? 6'd1 : 6'd0);
-			for (i = 0; i < (1 << BANK_BITS); i = i + 1)
+			for (i = 0; i < (1 << BANK_BITS); i = i + 1) begin
 				if (bank_cnt[i] != 4'd0) bank_cnt[i] <= bank_cnt[i] - 4'd1;
+				bfree[i] <= (bank_cnt[i] <= 4'd1);
+			end
 
 			(* parallel_case *) case (1'b1)
 
@@ -1108,6 +1123,7 @@ module mlm_ddr3_ctrl #(
 					phy_ba_o <= st_bank;
 					phy_a_o <= {{(16-ROW_BITS){1'b0}}, st_row};
 					bank_cnt[st_bank] <= CYC_RC_BUSY[3:0];
+					bfree[st_bank] <= (CYC_RC_BUSY[3:0] == 4'd0);
 					// tRCD of one cycle: READ next. Of two: a cycle's
 					// pause (tRRD: the next ACTIVATE is two cycles on),
 					// then ACTIVATE the next block, then READ this one.
@@ -1122,6 +1138,7 @@ module mlm_ddr3_ctrl #(
 					phy_ba_o <= st_nbank;
 					phy_a_o <= {{(16-ROW_BITS){1'b0}}, st_nrow};
 					bank_cnt[st_nbank] <= CYC_RC_BUSY[3:0];
+					bfree[st_nbank] <= (CYC_RC_BUSY[3:0] == 4'd0);
 					st_pre <= 1'b1;
 				end
 				begin state <= S_ST_RD; soh <= oh(S_ST_RD); end
@@ -1131,8 +1148,10 @@ module mlm_ddr3_ctrl #(
 				phy_ba_o <= st_bank;
 				phy_a_o <= {5'd0, 1'b1, st_cblk, 3'b000};
 				phy_rden_o <= 1'b1;
-				if (bank_cnt[st_bank] < CYC_RD_BUSY[3:0] + 4'd1)
+				if (bank_cnt[st_bank] < CYC_RD_BUSY[3:0] + 4'd1) begin
 					bank_cnt[st_bank] <= CYC_RD_BUSY[3:0];
+					bfree[st_bank] <= (CYC_RD_BUSY[3:0] == 4'd0);
+				end
 				st_blk <= st_blk + 1'b1;
 				st_nblk <= st_nblk + 1'b1;
 				st_left <= st_left - 9'd1;

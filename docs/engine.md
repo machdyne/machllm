@@ -104,9 +104,9 @@ stream (128-bit blocks) -> FIFO (32 blocks, LUT RAM) -> head register
 ```
 
 One 64-bit word per cycle: what the memory delivers at its best. The
-multipliers use the DSP blocks' own input and output registers
-(`rtl/mlm_mul18s.v`), so each route into and out of a block is a path of
-its own.
+multipliers' operands and products are registered in the fabric
+(`rtl/mlm_mul18s.v`; the DSP blocks' own registers gave zeros on the
+board), so a route into or out of a block can be a long one.
 
 ## Requests and credits
 

@@ -9,6 +9,7 @@
  *   0x0000_0000  RAM      BRAM_KB of block RAM: firmware, stack, buffers
  *   0x4000_0000  MAIN     512 MB DDR3 (mlm_ddr3: model image, KV cache)
  *   0x7000_0000  SYSCTL   0 LED, 4 ID "MLLM", 8 BUILD (parameter)
+ *   0x7600_0000  UI       the screen and the keyboard (UI = 1; rtl/mlm_ui.v)
  *   0x7000_0700  DDR3     Zeitlos's DDR3 registers (status, tune, ctrl)
  *   0x7100_0000  UART
  *   0x7200_0000  SD
@@ -35,7 +36,8 @@ module mlm_soc #(
 	parameter MEM_MHZ = SYS_MHZ,
 	parameter INIT_FILE = "",
 	parameter [31:0] BUILD = 32'h0,
-	parameter SIM_DDR3 = 0                // simulation: controller + sim/mem DRAM model, no PHY
+	parameter SIM_DDR3 = 0,               // simulation: controller + sim/mem DRAM model, no PHY
+	parameter UI = 0                      // the screen and keyboard (rtl/mlm_ui.v)
 ) (
 	input wire clk,
 	input wire rst,
@@ -73,7 +75,18 @@ module mlm_soc #(
 	input wire sd_cmd_i,
 	input wire [3:0] sd_dat_i,
 
-	output reg led
+	output reg led,
+
+	// UI = 1 only
+	input wire pclk,
+	input wire bclk,
+	input wire clk12,
+	output wire [1:0] tmds_clk,
+	output wire [1:0] tmds_r,
+	output wire [1:0] tmds_g,
+	output wire [1:0] tmds_b,
+	inout wire usb_dp,
+	inout wire usb_dm
 );
 
 	wire fclk = TWO_CLK ? mclk : clk;
@@ -119,6 +132,7 @@ module mlm_soc #(
 	wire t_vu    = (m_adr[31:24] == 8'h73);
 	wire t_mir   = (m_adr[31:24] == 8'h74);
 	wire t_xst   = (m_adr[31:24] == 8'h75);
+	wire t_ui    = (m_adr[31:24] == 8'h76) && UI;
 
 	// a slow access in progress: its target, address and data held
 	reg pend;
@@ -247,7 +261,7 @@ module mlm_soc #(
 		if (rst) begin
 			pend <= 1'b0;
 			pt <= 3'd0;
-		end else if (take && !t_ram && !t_mir && !t_xst && !ln_hit) begin
+		end else if (take && !t_ram && !t_mir && !t_xst && !t_ui && !ln_hit) begin
 			pend <= 1'b1;
 			pt <= t_main ? 3'd1 : t_dreg ? 3'd2 : t_uart ? 3'd3 : t_sd ? 3'd4 :
 			      t_eng ? 3'd5 : t_vu ? 3'd7 : 3'd6;
@@ -343,8 +357,25 @@ module mlm_soc #(
 		assign b_ack = 1'b0; assign b_rdat = 32'd0;
 	end endgenerate
 
-	assign m_ack = ram_ack || mir_ack || xst_ack || ln_ack || s_ackd;
-	assign m_rdat = ram_ack ? ram_q : mir_ack ? mir_q : xst_ack ? 32'd0 : ln_ack ? ln_q : s_rdat;
+	// the screen and keyboard: answers the next cycle, as the RAM
+	wire ui_ack;
+	wire [31:0] ui_q;
+	generate if (UI) begin : g_ui
+		mlm_ui ui (
+			.clk(clk), .rst(rst), .adr(m_adr[13:0]), .wdat(m_wdat), .we(m_we),
+			.stb(take && t_ui), .rdat(ui_q), .ack(ui_ack),
+			.pclk(pclk), .bclk(bclk),
+			.tmds_clk(tmds_clk), .tmds_r(tmds_r), .tmds_g(tmds_g), .tmds_b(tmds_b),
+			.clk12(clk12), .usb_dp(usb_dp), .usb_dm(usb_dm)
+		);
+	end else begin : g_noui
+		assign ui_ack = 1'b0;
+		assign ui_q = 32'd0;
+		assign tmds_clk = 2'b00; assign tmds_r = 2'b00; assign tmds_g = 2'b00; assign tmds_b = 2'b00;
+	end endgenerate
+
+	assign m_ack = ram_ack || mir_ack || xst_ack || ln_ack || ui_ack || s_ackd;
+	assign m_rdat = ram_ack ? ram_q : mir_ack ? mir_q : xst_ack ? 32'd0 : ln_ack ? ln_q : ui_ack ? ui_q : s_rdat;
 
 	// ---------------------------------------------------------------
 	// SYSCTL

@@ -57,8 +57,13 @@ Zeitlos's `ddr3_clk` with the clock as a parameter.
 | `make MEM_MHZ=75` | 150 MT/s | 75 MHz | 50 MHz |
 | `make` | 96 MT/s | 48 MHz, one clock domain | |
 
-At 90 MHz only some placement seeds meet timing; `MEM_MHZ=100` reaches
-92-95 MHz and does not.
+At 90 MHz only some placement seeds meet timing (with the screen: seed
+6, 92.5 MHz); `MEM_MHZ=100` reaches 92-95 MHz and does not. The
+controller keeps a registered "free" flag per bank next to each
+bank's busy counter (`bfree`, always equal to `bank_cnt == 0`, which
+simulation checks every cycle), so the stream's next-command decision
+does not wait for a 4-bit compare; that took the 90 MHz build's worst
+path from 80-86 MHz to 85-92.
 
 `:gap N` on the console (DDR3 CTRL[5:4]) puts N idle cycles after each
 stream READ, a fallback if back-to-back reads ever misbehave on a board.

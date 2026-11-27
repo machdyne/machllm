@@ -23,9 +23,11 @@ placed `soc.config` and `fw_rand.hex` of the build directory (both in
 the release zips). With yowasp: `ECPBRAM="python3 tools/ecpbram.py"
 ECPPACK=yowasp-ecppack` (yowasp's own ecpbram lacks its database).
 `tools/timing_iter.sh 90 1 2` places seeds side by side (`soc.config`
-is then the chosen `sN.config`). The releases were placed that way,
-with `NPR_ARGS="--placer-heap-timingweight 30 --placer-heap-critexp 4"`;
-at 90 MHz only some seeds meet timing (bonsai-v4: seed 3 of 1-4).
+is then the chosen `sN.config`). At 90 MHz only some seeds meet timing;
+the Makefile's defaults are the ones that did with the screen: seed 6
+and `--placer-heap-timingweight 30 --placer-heap-critexp 4` (memory
+side 92.5 MHz, CPU 52.7; seeds 2-5 fall short). Another nextpnr
+version can place differently, so check `pnr.log`'s clocks.
 
 Timing is checked for speed grade 6; the log is `build/sergei_ml2/pnr.log`
 ("Max frequency for clock '$glbnet$clk'" must be at least 48 MHz).
@@ -60,6 +62,9 @@ of the GGUF, to check the integer path against. `:v` prints the time per
 token by section; `:e` runs the engine on simple inputs and prints its
 results against the CPU's (the board-side check of the multipliers);
 `:k` turns the CPU's main-memory read line off and on.
+After a restart, the first lines say whether the FPGA was reloaded or
+only the CPU restarted, and where generation stopped (a black box in
+the last 32 bytes of the RAM).
 
 ### Checking a new bitstream
 
@@ -83,6 +88,25 @@ first.
 tools/mkcard.sh /media/you/CARD build/models/stories42M.mlm   # -> STORIES4.MLM
 tools/mkcard.sh -i card.img 512 a.mlm b.mlm                   # an image to dd
 ```
+
+## The screen and keyboard
+
+With the screen and keyboard built in (the default; `UI=0` leaves them
+out), a monitor on the HDMI connector shows 80 x 25 characters
+(640x480, DVI) and a USB keyboard goes in the first USB host port
+(a plain keyboard, no hub).
+
+- Type a question and press **Enter**. Long questions wrap; the input
+  grows to six lines (up to 511 characters).
+- **Esc** clears what you typed; while an answer is being written, it
+  stops it.
+- **F1** starts a new conversation.
+- The bottom line shows what is happening: "Reading your question"
+  with a bar, then "Writing...".
+
+The keyboard layout is US. The screen shows ASCII: the model's
+typographic quotes and dashes appear as plain ones. The serial console
+keeps working, and what is typed there also shows on the screen.
 
 ## The console
 

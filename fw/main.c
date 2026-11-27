@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include "hw.h"
+#include "ui.h"
 #include "common/mlm.h"
 #include "common/mlm_plat.h"
 #include "common/mlm_model.h"
@@ -24,6 +25,13 @@ void plat_putc(int c)
 	UART_DATA = (uint32_t)c;
 }
 static void puts_(const char *s) { while (*s) plat_putc(*s++); }
+/* the black box: the last 32 bytes of the RAM, which startup does not
+ * clear. It survives a CPU restart (a reset or a jump to 0) but not a
+ * reload of the FPGA (the RAM then holds the bitstream's contents) */
+typedef struct { uint32_t magic, boots, busy, pos, gen, sec, ticks, spare; } bbox_t;
+#define BBOX ((volatile bbox_t *)(0x18000 - 32))
+#define BBOX_MAGIC 0x6d6c6c6du
+
 static void put_hex(uint32_t v, int n) { while (n--) plat_putc("0123456789abcdef"[(v >> (4 * n)) & 15]); }
 static void put_dec(uint32_t v)
 {
@@ -39,14 +47,24 @@ static int getc_(void)
 	do d = UART_DATA; while (d & 0x100);
 	return (int)(d & 0xff);
 }
+/* a line from the serial console or the keyboard (fw/ui.c), whichever
+ * types; shown on both. Returns its length, or -1 for F1 (a new
+ * conversation). Esc on the keyboard clears the line. */
 static int readline(char *b, int max)
 {
 	int n = 0;
+	ui_input(b, 0, 1);
 	for (;;) {
-		int c = getc_();
-		if (c == '\r' || c == '\n') { puts_("\n"); b[n] = 0; return n; }
-		if ((c == 8 || c == 127) && n) { n--; puts_("\b \b"); continue; }
-		if (c >= 32 && n < max - 1) { b[n++] = (char)c; plat_putc(c); }
+		int c = -1, kb = 0;
+		uint32_t d = UART_DATA;
+		if (!(d & 0x100)) c = (int)(d & 0xff);
+		else if ((c = ui_key()) >= 0) kb = 1;
+		if (c < 0) continue;
+		if (c == UI_F1) { b[0] = 0; ui_input(b, 0, 0); return -1; }
+		if (c == 27 && kb) { while (n) { n--; puts_("\b \b"); } ui_input(b, 0, 1); continue; }
+		if (c == '\r' || c == '\n') { puts_("\n"); b[n] = 0; ui_input(b, 0, 0); return n; }
+		if ((c == 8 || c == 127) && n) { n--; puts_("\b \b"); ui_input(b, n, 1); continue; }
+		if (c >= 32 && c < 127 && n < max - 1) { b[n++] = (char)c; plat_putc(c); ui_input(b, n, 1); }
 	}
 }
 static uint64_t cycles(void)
@@ -228,6 +246,7 @@ void plat_prof(int sec)
 		prof_e[prof_cur] += eng_cycles_total - prof_elast;
 	}
 	prof_cur = sec; prof_last = now; prof_elast = eng_cycles_total;
+	BBOX->sec = (uint32_t)sec; BBOX->ticks++;
 }
 int plat_prof_cur(void) { return prof_cur; }
 COLD static void prof_report(void)
@@ -760,14 +779,14 @@ static void put_tok(uint32_t prev, uint32_t tok)
 {
 	uint32_t len;
 	const uint8_t *s = mlm_decode(&M, prev, tok, &len);
-	for (uint32_t i = 0; s && i < len; i++) text_out(s[i]);
+	for (uint32_t i = 0; s && i < len; i++) { text_out(s[i]); ui_out(s[i]); }
 }
 
 static uint32_t toks[600];         /* a 511-character line plus the chat template */
 static uint32_t max_new = 256;
 static int verbose;
 
-static void generate(const char *line)
+COLD static void generate(const char *line)
 {
 	col = wcols = wlen = 0;
 	const mlm_header_t *h = M.hdr;
@@ -795,17 +814,26 @@ static void generate(const char *line)
 		if (M.pos + n + 32 > M.ctx) { puts_("[context full: starting over]\n"); mlm_init(&M, ctx_len); }
 	}
 	if (!n) return;
+	ui_user(line);
+	ui_answer_begin();
 	eng_cycles_total = eng_waits_total = 0;
 	uint64_t t0 = cycles(), t_first = 0;
+	int full = 0;
 	uint32_t tok = toks[0], prev = h->bos_id, gen = 0;
 	if (!qwen) put_tok(prev, tok);
 	/* a chat turn's prompt is not printed: show that it is being read */
 	if (qwen) { puts_("(reading "); put_dec((uint32_t)n); puts_(" tokens) "); }
+	BBOX->busy = 1; BBOX->ticks = 0;
 	for (int i = 0; ; i++) {
+		BBOX->pos = M.pos; BBOX->gen = gen;
 		uint64_t s0 = cycles();
 		uint64_t e0 = eng_cycles_total;
-		if (mlm_step_ex(&M, tok, i + 1 >= n)) { puts_("\n[context full]"); break; }
+		if (mlm_step_ex(&M, tok, i + 1 >= n)) { puts_("\n[context full]"); full = 1; break; }
 		if (qwen && i < n) plat_putc(i + 1 < n ? '.' : '\n');
+		if (i < n) {
+			if (i + 1 < n) ui_progress(i + 1, n);
+			else ui_status("Writing...    Esc: stop");
+		}
 		if (verbose) {
 			uint32_t dt = (uint32_t)(cycles() - s0), de = (uint32_t)ENG_CPU(eng_cycles_total - e0);
 			puts_("{"); put_dec(M.pos - 1); puts_(": "); put_dec(dt / 1000); puts_(" kcyc, engine ");
@@ -835,8 +863,13 @@ static void generate(const char *line)
 			uint32_t c = UART_DATA & 0xff;
 			if (c != '\n') { text_end(); puts_(" [stopped]"); break; }
 		}
+		if (ui_key() == 27) { text_end(); puts_(" [stopped]"); break; }
 	}
+	BBOX->busy = 0;
 	text_end();
+	ui_answer_end();
+	if (full) ui_status("The conversation is full: press F1 to start a new one");
+	else ui_ready();
 	(void)prev;
 	uint64_t t = cycles() - t0;
 	uint64_t tg = t - t_first;
@@ -919,7 +952,25 @@ COLD static void card_setup(void)
 	if (n_models) model_ok = load_model(0);
 }
 
-int main(void)
+static void bbox_report(void)
+{
+	if (BBOX->magic != BBOX_MAGIC) {
+		puts_("(fresh start: FPGA configured)\n");
+		BBOX->magic = BBOX_MAGIC; BBOX->boots = 0; BBOX->busy = 0;
+		return;
+	}
+	BBOX->boots++;
+	puts_("(restart "); put_dec(BBOX->boots); puts_(" without reloading the FPGA");
+	if (BBOX->busy) {
+		puts_("; it stopped while generating: position "); put_dec(BBOX->pos);
+		puts_(", token "); put_dec(BBOX->gen); puts_(" of the answer, section "); put_dec(BBOX->sec);
+		puts_(", step "); put_dec(BBOX->ticks);
+	}
+	puts_(")\n");
+	BBOX->busy = 0;
+}
+
+COLD int main(void)
 {
 	static char line[512];
 	LED = 1;
@@ -933,6 +984,7 @@ int main(void)
 	SYS_LINE = 1;
 #else
 	puts_("\nmachllm " MLM_BUILD_STR " (zeitlos32ps, Sergei ML2)\n");
+	bbox_report();
 	/* train until both lanes are centred and the memory test passes;
 	 * a marginal training otherwise corrupts everything after it */
 	int bad = 1;
@@ -949,6 +1001,7 @@ int main(void)
 #endif
 
 	if (vu_present()) { mlm_vu = fw_vu; puts_("vector unit: on\n"); }
+	if (ui_init()) { puts_("screen: on\n"); ui_status("Loading the model, please wait..."); }
 	card_setup();
 	if (!model_ok && ((const mlm_header_t *)plat_mem())->magic == MLM_MAGIC) {
 		/* no card, but an image already in memory (a debugger, or the
@@ -964,9 +1017,18 @@ int main(void)
 #endif
 	M.rng = (uint32_t)cycles() | 1;
 	help();
+	if (model_ok) ui_ready();
+	else ui_status("No model found: please put BONSAI.MLM on the SD card and restart");
 	for (;;) {
 		puts_(model_ok ? "> " : "(no model) > ");
-		readline(line, sizeof(line));
+		if (readline(line, sizeof(line)) < 0) {
+			/* F1: a new conversation */
+			if (model_ok) mlm_init(&M, ctx_len);
+			puts_("(new conversation)\n");
+			ui_clear();
+			ui_ready();
+			continue;
+		}
 		if (line[0] == ':') {
 			const char *a = line + 1;
 			while (*a && *a != ' ') a++;

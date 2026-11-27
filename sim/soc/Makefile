@@ -3,7 +3,7 @@
 #               the generated text must equal mlm_run's
 ROOT = ../..
 Z = $(ROOT)/ext/zeitlos/rtl
-RTL = $(ROOT)/rtl/mlm_soc.v $(ROOT)/rtl/mlm_vu.v $(ROOT)/rtl/mlm_engine.v $(ROOT)/rtl/mlm_mul16r.v $(ROOT)/rtl/mlm_mul18s.v $(ROOT)/rtl/mlm_uart.v $(ROOT)/rtl/sd/mlm_sd.v \
+RTL = $(ROOT)/rtl/mlm_soc.v $(ROOT)/rtl/mlm_ui.v $(ROOT)/rtl/mlm_vu.v $(ROOT)/rtl/mlm_engine.v $(ROOT)/rtl/mlm_mul16r.v $(ROOT)/rtl/mlm_mul18s.v $(ROOT)/rtl/mlm_uart.v $(ROOT)/rtl/sd/mlm_sd.v \
       $(ROOT)/rtl/mem/mlm_ddr3_ctrl.v $(ROOT)/sim/mem/mlm_dram_model.v \
       $(Z)/cpu/zeitlos32ps/zeitlos32ps.v $(Z)/cpu/zeitlos32ps/zeitlos32ps_alu.v \
       $(Z)/cpu/zeitlos32/zeitlos32_decode.v $(Z)/cpu/zeitlos32/zeitlos32_lsu.v \
@@ -23,6 +23,15 @@ FW2 = $(ROOT)/build/sim2c/fw.hex
 obj_2c/Vmlm_soc: $(RTL) tb_soc.cpp ../sd/sdcard_model.h $(FW2)
 	verilator -I$(ROOT)/rtl $(subst $(abspath $(FW)),$(abspath $(FW2)),$(VFLAGS)) -GTWO_CLK=1 -GSYS_MHZ=50 -GMEM_MHZ=75 \
 		-CFLAGS "-DTB_TWO_CLK -DTB_CPU_MHZ=50 -DTB_MEM_MHZ=75 -DTB_UART_DIV=50" -Mdir obj_2c $(RTL) tb_soc.cpp
+
+# the same with the screen and keyboard (UI = 1); at the end the screen's
+# cells go to ui_screen.txt
+obj_ui/Vmlm_soc: $(RTL) tb_soc.cpp ../sd/sdcard_model.h $(FW2) $(ROOT)/rtl/mlm_hid_rom.v
+	verilator -I$(ROOT)/rtl $(subst $(abspath $(FW)),$(abspath $(FW2)),$(VFLAGS)) -GTWO_CLK=1 -GSYS_MHZ=50 -GMEM_MHZ=75 -GUI=1 \
+		--public-flat-rw +define+MLM_FONT_FILE='"$(abspath $(ROOT))/rtl/mlm_font8x16.hex"' \
+		+define+MLM_HID_ROM='"$(abspath $(Z))/ext/usb_hid_host/src/usb_hid_host_rom.hex"' \
+		-CFLAGS "-DTB_TWO_CLK -DTB_CPU_MHZ=50 -DTB_MEM_MHZ=75 -DTB_UART_DIV=50 -DTB_UI" -Mdir obj_ui \
+		$(RTL) $(ROOT)/rtl/mlm_hid_rom.v $(Z)/ext/usb_hid_host/src/usb_hid_host.v tb_soc.cpp
 
 $(FW2): $(ROOT)/fw/*.c $(ROOT)/fw/*.h $(ROOT)/fw/common/*.c $(ROOT)/fw/common/*.h
 	$(MAKE) -C $(ROOT)/fw sim2c

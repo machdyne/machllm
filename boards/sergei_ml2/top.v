@@ -20,6 +20,9 @@
 `ifndef MEM_MHZ
 `define MEM_MHZ `SYS_MHZ
 `endif
+`ifndef UI
+`define UI 0
+`endif
 `ifndef FW_HEX
 `define FW_HEX "build/sergei_ml2/fw.hex"
 `endif
@@ -49,7 +52,17 @@ module top (
 	output wire [1:0] ddr3_dm,
 	inout wire [15:0] ddr3_dq,
 	inout wire [1:0] ddr3_dqs_p,
-	output wire ddr3_clk_p
+	output wire ddr3_clk_p,
+
+	// the screen (DVI on the DDMI connector) and keyboard (first USB
+	// host port); used with UI = 1 (`make UI=1`, the default with two
+	// clock domains)
+	output wire DDMI_CK_P,
+	output wire DDMI_D0_P,
+	output wire DDMI_D1_P,
+	output wire DDMI_D2_P,
+	inout wire usb_host_dp,
+	inout wire usb_host_dm
 );
 	// One clock domain (MEM_MHZ = SYS_MHZ = 48): everything on the DDR3
 	// system clock. Two: the memory side on the DDR3 system
@@ -57,11 +70,27 @@ module top (
 	localparam TWO_CLK = (`MEM_MHZ != `SYS_MHZ);
 	wire mclk, init_clk, eclk, ddrdel, pause, phy_rst, phy_ready, locked;
 
+	wire clk12;
 	mlm_ddr3_clk #(.EDGE_MHZ(2 * `MEM_MHZ)) clocks (
 		.clk48_i(CLK_48), .rst_i(1'b0),
 		.sys_clk_o(mclk), .eclk_o(eclk), .ddrdel_o(ddrdel), .pause_o(pause),
-		.phy_rst_o(phy_rst), .ready_o(phy_ready), .locked_o(locked), .init_clk_o(init_clk)
+		.phy_rst_o(phy_rst), .ready_o(phy_ready), .locked_o(locked), .init_clk_o(init_clk),
+		.clk12_o(clk12)
 	);
+	// the screen's clocks: 126 MHz (two TMDS bits a cycle) and 25.2
+	localparam UI = `UI && TWO_CLK;
+	wire pclk, bclk;
+	wire [1:0] t_c, t_r, t_g, t_b;
+	generate if (UI) begin : g_video
+		mlm_vpll vpll (.clkin(CLK_48), .bclk(bclk), .pclk(pclk), .locked());
+		ODDRX1F o_c (.D0(t_c[0]), .D1(t_c[1]), .Q(DDMI_CK_P), .SCLK(bclk), .RST(1'b0));
+		ODDRX1F o_r (.D0(t_r[0]), .D1(t_r[1]), .Q(DDMI_D2_P), .SCLK(bclk), .RST(1'b0));
+		ODDRX1F o_g (.D0(t_g[0]), .D1(t_g[1]), .Q(DDMI_D1_P), .SCLK(bclk), .RST(1'b0));
+		ODDRX1F o_b (.D0(t_b[0]), .D1(t_b[1]), .Q(DDMI_D0_P), .SCLK(bclk), .RST(1'b0));
+	end else begin : g_novideo
+		assign pclk = 1'b0; assign bclk = 1'b0;
+		assign DDMI_CK_P = 1'b0; assign DDMI_D0_P = 1'b0; assign DDMI_D1_P = 1'b0; assign DDMI_D2_P = 1'b0;
+	end endgenerate
 	wire clk = TWO_CLK ? init_clk : mclk;
 
 	// reset: held until the PLL locks, then 1024 cycles more (each domain)
@@ -79,7 +108,7 @@ module top (
 	wire cmd_o, cmd_oe;
 	assign SD_MOSI = cmd_oe ? cmd_o : 1'bz;
 
-	mlm_soc #(.INIT_FILE(`FW_HEX), .SYS_MHZ(`SYS_MHZ), .TWO_CLK(TWO_CLK), .MEM_MHZ(`MEM_MHZ)) soc (
+	mlm_soc #(.INIT_FILE(`FW_HEX), .SYS_MHZ(`SYS_MHZ), .TWO_CLK(TWO_CLK), .MEM_MHZ(`MEM_MHZ), .UI(UI)) soc (
 		.clk(clk), .rst(rst), .mclk(mclk), .mrst(mrst),
 		.eclk(eclk), .ddrdel(ddrdel), .pause(pause), .phy_rst(phy_rst),
 		.phy_ready(phy_ready), .pll_locked(locked),
@@ -90,6 +119,9 @@ module top (
 		.uart_tx(UART0_TX), .uart_rx(UART0_RX),
 		.sd_sck(SD_SCK), .sd_cmd_o(cmd_o), .sd_cmd_oe(cmd_oe), .sd_cmd_i(SD_MOSI),
 		.sd_dat_i({SD_SS, SD_D2, SD_D1, SD_MISO}),
-		.led(LED_B)
+		.led(LED_B),
+		.pclk(pclk), .bclk(bclk), .clk12(clk12),
+		.tmds_clk(t_c), .tmds_r(t_r), .tmds_g(t_g), .tmds_b(t_b),
+		.usb_dp(usb_host_dp), .usb_dm(usb_host_dm)
 	);
 endmodule

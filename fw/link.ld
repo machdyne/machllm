@@ -4,5 +4,6 @@ SECTIONS {
 	.text : { *(.text.start) *(.text*) *(.rodata*) *(.srodata*) } > RAM
 	.data : { *(.data*) *(.sdata*) } > RAM
 	.bss (NOLOAD) : { _bss_start = .; *(.bss*) *(.sbss*) *(COMMON) . = ALIGN(4); _bss_end = .; } > RAM
-	_stack_top = ORIGIN(RAM) + LENGTH(RAM);
+	/* the last 32 bytes: the black box (fw/main.c), kept over a restart */
+	_stack_top = ORIGIN(RAM) + LENGTH(RAM) - 32;
 }

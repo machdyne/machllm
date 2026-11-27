@@ -13,8 +13,10 @@ entirely in our own open gateware and firmware, offline.
   GGUF (`Q1_0`) to a 246 MB `.mlm` image. The engine is built for 1-bit
   weights; 4- and 8-bit weight models are no longer supported (8-bit
   stays for the attention cache).
-- **Interface:** serial console (1,000,000 8N1). A text terminal and USB
-  keyboard come later; their space is reserved.
+- **Interface:** a screen (640x480 over the HDMI connector, DVI) and a
+  USB keyboard: type a question, read the answer. The serial console
+  (1,000,000 8N1) works alongside. `make UI=0` leaves the screen and
+  keyboard out.
 
 ## How it works
 
@@ -56,7 +58,7 @@ Known limits:
 - The firmware does not yet refuse a model image with 4- or 8-bit
   weights (an old one loads and produces nonsense).
 - Builds for Sergei ML2 only; Mozart ML2 pins are not done. At 90 MHz
-  only some placement seeds meet timing.
+  only some placement seeds meet timing (the Makefile's default does).
 
 ## Quick start
 

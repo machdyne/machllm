@@ -16,12 +16,14 @@ module mlm_pll #(
 	input wire clkin,
 	output wire clkout0,
 	output wire clkout2,
+	output wire clkout3,      // 12 MHz (USB, rtl/mlm_ui.v): VCO / 45 (540), / 50 (600), / 53 (640: 12.08)
 	output wire locked
 );
 	localparam CLKI_DIV  = (EDGE_MHZ == 200) ? 6 : (EDGE_MHZ == 180) ? 4 : (EDGE_MHZ == 128) ? 3 : 8;
 	localparam CLKOP_DIV = (EDGE_MHZ == 200 || EDGE_MHZ == 180) ? 3 : (EDGE_MHZ == 128) ? 5 : 4;
 	localparam CLKFB_DIV = (EDGE_MHZ == 180) ? 15 : (EDGE_MHZ == 128) ? 8 : 25;
 	localparam OS2_DIV   = (EDGE_MHZ == 180) ? 11 : (EDGE_MHZ == 128) ? 13 : 12;
+	localparam OS3_DIV   = (EDGE_MHZ == 180) ? 45 : (EDGE_MHZ == 128) ? 53 : 50;
 	(* ICP_CURRENT="12" *) (* LPF_RESISTOR="8" *) (* MFG_ENABLE_FILTEROPAMP="1" *) (* MFG_GMCREF_SEL="2" *)
 	EHXPLLL #(
 		.PLLRST_ENA("DISABLED"), .INTFB_WAKE("DISABLED"), .STDBY_ENABLE("DISABLED"),
@@ -32,11 +34,11 @@ module mlm_pll #(
 		.CLKOP_ENABLE("ENABLED"), .CLKOP_DIV(CLKOP_DIV), .CLKOP_CPHASE(CLKOP_DIV - 1), .CLKOP_FPHASE(0),
 		.CLKOS_ENABLE("DISABLED"), .CLKOS_DIV(6), .CLKOS_CPHASE(2), .CLKOS_FPHASE(0),
 		.CLKOS2_ENABLE("ENABLED"), .CLKOS2_DIV(OS2_DIV), .CLKOS2_CPHASE(OS2_DIV - 1), .CLKOS2_FPHASE(0),
-		.CLKOS3_ENABLE("DISABLED"), .CLKOS3_DIV(12), .CLKOS3_CPHASE(2), .CLKOS3_FPHASE(0),
+		.CLKOS3_ENABLE("ENABLED"), .CLKOS3_DIV(OS3_DIV), .CLKOS3_CPHASE(OS3_DIV - 1), .CLKOS3_FPHASE(0),
 		.FEEDBK_PATH("CLKOP"), .CLKFB_DIV(CLKFB_DIV)
 	) pll_i (
 		.RST(1'b0), .STDBY(1'b0), .CLKI(clkin),
-		.CLKOP(clkout0), .CLKOS(), .CLKOS2(clkout2), .CLKOS3(),
+		.CLKOP(clkout0), .CLKOS(), .CLKOS2(clkout2), .CLKOS3(clkout3),
 		.CLKFB(clkout0), .CLKINTFB(),
 		.PHASESEL0(1'b0), .PHASESEL1(1'b0), .PHASEDIR(1'b1), .PHASESTEP(1'b1),
 		.PHASELOADREG(1'b1), .PLLWAKESYNC(1'b0), .ENCLKOP(1'b0),

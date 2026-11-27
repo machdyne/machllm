@@ -6,14 +6,14 @@ CFLAGS = -march=rv32im -mabi=ilp32 -O2 -flto -ffreestanding -fno-builtin-printf 
          -Wall -Wextra -Wno-unused-parameter -I. -Icommon \
          -DMLM_MAX_DIM=2048 -DMLM_MAX_SCRATCH=4096 -DMLM_MAX_HEADS=32 -DMLM_MAX_CTX=512 \
          -DMLM_BUILD_STR='"$(BUILD)"' -DMLM_PROFILE -DSYS_MHZ=$(SYS_MHZ) -DMEM_MHZ=$(MEM_MHZ) $(CFLAGS_EXTRA)
-SRC = crt0.S main.c libc.c common/mlm_model.c common/sd.c
+SRC = crt0.S main.c ui.c libc.c common/mlm_model.c common/sd.c
 OUT ?= ../build/sergei_ml2
 SYS_MHZ ?= 48
 MEM_MHZ ?= $(SYS_MHZ)
 
 all: $(OUT)/fw.hex
 
-$(OUT)/fw.elf: $(SRC) common/*.h hw.h link.ld
+$(OUT)/fw.elf: $(SRC) common/*.h hw.h ui.h link.ld
 	mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -T link.ld -o $@ $(SRC) -lgcc
 	$(CROSS)size $@
