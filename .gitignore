@@ -1,0 +1,8 @@
+build/
+ref/mlm_run
+ref/check/l2c_logits
+*.o
+obj_dir/
+__pycache__/
+obj_*/
+sim/rdasm/zeitlos_rdasm.v

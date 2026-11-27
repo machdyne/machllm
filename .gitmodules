@@ -1,0 +1,3 @@
+[submodule "ext/zeitlos"]
+	path = ext/zeitlos
+	url = https://github.com/machdyne/zeitlos.git
