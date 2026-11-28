@@ -71,7 +71,7 @@ the last 32 bytes of the RAM).
 1. At power-up: DDR3 training (`ddr3 tune ... L0:C L1:C`), `memtest
    ok`, the stream read (~650 MB/s at 90 MHz, ~540 at 75).
 2. After the model loads: `engine self-test: 256 rows, 0 wrong`, `glu
-   self-test: ... 0 wrong`, `vector unit self-test: 140 operations, 0
+   self-test: ... 0 wrong`, `vector unit self-test: 150 operations, 0
    wrong`.
 3. `:e`: no `DIFF` lines.
 4. `:temp 0` and a short question; `:v` for the time per token.

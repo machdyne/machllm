@@ -55,6 +55,12 @@ with the vector unit (MAXABS and KVQ8 per block).
 | 0x403c | GLU_P | bits 5:0 sg, 13:8 su (bank 0 / bank 1 results to 32 bits), 23:16 sq (signed: the sigmoid's input scale) |
 | 0x4040 | GLU_GO | write: start the GLU unit; CTRL reads busy until it is done |
 | 0x4044 | GLU_RES | read: psh (bits 7:0) and xsh (15:8), the exponent bookkeeping the CPU needs |
+| 0x4048 | CO_GO | copy-out: n (1..2048) rows' OUT32 values into the CPU's RAM from word CO_DST on; CTRL bit 1 busy |
+| 0x404c | CO_ROW | bank << 12, first row |
+| 0x4050 | PK_GO | the packer: n (bits 12:0) values, blocks of 32 (22:16); CTRL bit 2 busy |
+| 0x4054 | CO_DST | RAM word address of the copy-out's first row |
+| 0x4058 | PK_SRC | RAM word address of the packer's int32 v[0] |
+| 0x4060 | PK_S | read: the packing's s (the input's exponent is s − 15) |
 | 0x8000-0xffff | OUT bank 0 | row i's acc at 0x8000 + 8i (low word, high word) |
 | 0x18000-0x1ffff | OUT bank 1 | |
 | 0x10000-0x13fff | OUT32 bank 0 | row i at 0x10000 + 4i: (acc + 2^(SHIFT-1)) >> SHIFT, low 32 bits |
@@ -63,6 +69,15 @@ with the vector unit (MAXABS and KVQ8 per block).
 **Two output banks** let the CPU work on one run's results while the
 engine computes the next into the other bank. The CPU must not write X
 during a run.
+
+**The packer and the copy-out** work on the CPU's RAM through its second
+port, on the memory clock, a word a cycle. The packer is
+`eng_mx_pack()` (`fw/common/eng_spec.h`) in hardware: pass 1 reads v
+for each block of 32's largest |v| (its s_b), pass 2 reads it again and
+writes the int8 values four to an X word and each block's offset; a
+vector of n values takes about 2n memory cycles. The copy-out writes
+OUT32 values straight into the RAM (a run into the other bank may go
+on). The CPU starts either and polls CTRL.
 
 Bonsai's FFN (6144 hidden units) runs in two pieces of 3072: gate and
 up for a piece into the two banks, the GLU unit packs SiLU(gate) x up
@@ -135,5 +150,6 @@ command prints the engine's results against the CPU's for simple inputs.
   so a prompt costs less than one weight pass per token.
 - A hardware top-k for the output head; the CPU scans the logits
   (one 32-bit compare per row, under the next chunk's stream).
-- Attention's engine runs overlapped across heads (the CPU's share of a
-  Bonsai layer is still ~45%).
+- Attention reads each KV head's cache once per query head (Bonsai: two
+  query heads a KV head); both at once would need a second input
+  vector, as batched prefill does.

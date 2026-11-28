@@ -41,7 +41,7 @@ $(error mozart_ml2: pin file not written yet (SD D1/D2 balls needed))
 endif
 
 RTL_INC = rtl/mlm_sigtab.vh rtl/mlm_exp2tab.vh
-RTL = boards/$(BOARD)/top.v rtl/mlm_soc.v rtl/mlm_vu.v rtl/mlm_engine.v rtl/mlm_mul16r.v rtl/mlm_mul18s.v rtl/mlm_uart.v rtl/sd/mlm_sd.v \
+RTL = boards/$(BOARD)/top.v rtl/mlm_soc.v rtl/mlm_dma.v rtl/mlm_vu.v rtl/mlm_engine.v rtl/mlm_mul16r.v rtl/mlm_mul18s.v rtl/mlm_uart.v rtl/sd/mlm_sd.v \
       rtl/mem/mlm_ddr3.v rtl/mem/mlm_ddr3_ctrl.v \
       $(Z)/mem/ddr3_phy_ecp5.v rtl/mem/mlm_ddr3_rdasm.v rtl/mem/mlm_ddr3_clk.v rtl/mem/mlm_pll.v $(Z)/mem/ddr3_phy_init.v \
       $(Z)/clk/pll2.v $(Z)/cpu/zeitlos32ps/zeitlos32ps.v $(Z)/cpu/zeitlos32ps/zeitlos32ps_alu.v \

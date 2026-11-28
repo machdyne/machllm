@@ -80,14 +80,11 @@ enum {
 	MLM_VU_RSHR = 4,        /* a, d, n, p0 = s */
 	MLM_VU_RESID = 5,       /* a = h (= d), b = v, n, p0, p1 -> max |h| */
 	MLM_VU_MULSHR30 = 6,    /* a, d, n, p0 = k */
-	MLM_VU_QPACK = 7,       /* a, d, n, p0 = sh, p1 = padn */
 	MLM_VU_KVQ8 = 8,        /* a, d, n, p0 = s, p1 = r */
 	MLM_VU_ROPE = 9,        /* a = v (= d), b = rt, n = head dim, p0 = split */
 	MLM_VU_ATTSC = 10,      /* a (= d) raw scores, b = K scales, n, p0 = k0 -> max (signed) */
-	MLM_VU_EXPSUM = 11,     /* a (= d), n, p0 = max -> *sum */
-	MLM_VU_COEF = 12,       /* a (= d), b = V scales, n, p0 = max exponent -> max */
-	MLM_VU_QPACKU = 13,     /* as QPACK, unsigned values */
-	MLM_VU_MXPACK = 14,     /* a, n, p1 = padn -> d (int8 words), b (offsets), returns s */
+	/* 7, 11-14: QPACK, EXPSUM, COEF, QPACKU, MXPACK, no longer in the unit */
+	MLM_VU_EXPCOEF = 15,    /* a (= d), b = V scales, n, p0 = max score, p1 = max exponent -> max, *sum */
 };
 /* the same operations by the C loops, whatever mlm_vu is (tests) */
 uint32_t mlm_vu_ref(int op, const void *a, const void *b, void *d, uint32_t n,

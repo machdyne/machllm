@@ -5,13 +5,17 @@
 | | What runs | Checks |
 |---|---|---|
 | `ref/` | `mlm_run`: the model code + `eng_dot_spec()` on the PC | against llama2.c `run.c` (`ref/check/l2c_logits.c`) and a float Qwen3/Llama (`ref/check/hf_float.py`); `ref/check/cmp_logits.py` compares dumps |
-| `sim/engine` | `rtl/mlm_engine.v` + C++ memory with random latency and missing slots; the whole model code runs with the RTL as its engine | every call against `eng_dot_spec()` (results, MAXABS, OUT32; 1-bit weights and the 8-bit cache) and every GLU run against `glu_spec()`; the token ids equal `mlm_run -q`. Models (`tools/test_models.sh`, all 1-bit): stories15M shape, Qwen3-tiny, Bonsai-tiny (Bonsai's FFN width, two pieces) |
-| `sim/vu` | `rtl/mlm_vu.v` + RAM | 3,000 random runs of each of the 14 operations against `mlm_vu_ref()` (bit-exact, including the streamed ones) |
+| `sim/engine` | `rtl/mlm_engine.v` + C++ memory with random latency and missing slots, and a model of the CPU's RAM on the engine's second-port pins; the whole model code runs with the RTL as its engine | every call against `eng_dot_spec()` (results, MAXABS, OUT32; 1-bit weights and the 8-bit cache), every GLU run against `glu_spec()`, every packing (the packer) against `eng_mx_pack()` and every copy-out against the rows; the token ids equal `mlm_run -q`. Models (`tools/test_models.sh`, all 1-bit): stories15M shape, Qwen3-tiny, Bonsai-tiny (Bonsai's FFN width, two pieces) |
+| `sim/vu` | `rtl/mlm_vu.v` + RAM | 3,000 random runs of the 10 operations against `mlm_vu_ref()` (bit-exact), and each one's cycles an element |
 | `sim/ui` | `rtl/mlm_ui.v`: cells written through the CPU port, a whole frame run | the TMDS symbols decoded back to pixels (`out.ppm`), sync widths, the visible pixel count, read-back of cells and registers |
 | `sim/rdasm` | the DDR3 read assembly (`rtl/mem/mlm_ddr3_rdasm.v`) | against Zeitlos's, cycle by cycle |
 | `sim/mem` | engine + `rtl/mem/mlm_ddr3_ctrl.v` + `sim/mem/mlm_dram_model.v` (DRAM protocol and timing checker, storage in C++) | CPU path: 600 stores (words, halves, bytes through read-modify-write) and 1024 loads under the new address map; the whole model through the stream port; token ids equal `mlm_run`; again with stream gap 1 |
 | `sim/sd` | `rtl/sd/mlm_sd.v` + controller block writes + DRAM model; C++ SD card with a FAT32 image | `fw/common/sd.c` initialises the card (4-bit), mounts FAT32, lists, loads a 2.2 MB file; it must arrive intact |
-| `sim/soc` | `rtl/mlm_soc.v` with zeitlos32ps running the real firmware (built with `-DSIM`: no DDR3 training, fast UART), DRAM model, SD card model, UART decoded in C++ | boots, tests (engine and GLU self-tests), loads TINY.MLM from the card, takes a typed prompt; the printed text must equal `mlm_run`'s. `TB_CMD2=:g` or `:o` runs the same with SwiGLU on the CPU or without overlap: the text must still be equal |
+| `sim/soc` | `rtl/mlm_soc.v` (with the DMA unit and the RAM's second port) and zeitlos32ps running the real firmware (built with `-DSIM`: no DDR3 training, fast UART), DRAM model, SD card model, UART decoded in C++ | boots, tests (engine and GLU self-tests), loads TINY.MLM from the card, takes a typed prompt; the printed text must equal `mlm_run`'s. `TB_CMD2=:g` or `:o` runs the same with SwiGLU on the CPU or without overlap: the text must still be equal |
+
+In simulation the SOC also stops if the engine and the DMA unit ever
+want the RAM's second port or the memory stream at the same time (the
+firmware never lets them).
 
 `make -C sim/soc test-2c` is the same with two clock domains (CPU 50 MHz,
 memory side 75 MHz, as `make MEM_MHZ=75`); `make -C sim/mem test-fast`

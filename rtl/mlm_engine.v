@@ -38,6 +38,17 @@
  *   0x403c         GLU_P   [5:0] sg, [13:8] su, [23:16] sq (signed)
  *   0x4040         GLU_GO  write: start the GLU unit (CTRL bit 0 is busy)
  *   0x4044         GLU_RES [7:0] psh, [15:8] xsh (signed)
+ *   0x4048         CO_GO   copy-out: n (1..2048) rows' OUT32 values into
+ *                  the CPU's RAM from word CO_DST on (CTRL bit 1 busy)
+ *   0x404c         CO_ROW  bank << 12 | first row
+ *   0x4050         PK_GO   the packer: [12:0] n, [22:16] blocks of 32
+ *                  (padn / 32): int32 v[0..n) from the RAM at word
+ *                  PK_SRC, MX-packed into X (eng_mx_pack, eng_spec.h;
+ *                  zero from n on); CTRL bit 2 busy
+ *   0x4054         CO_DST  RAM word address of the copy-out's first row
+ *   0x4058         PK_SRC  RAM word address of v[0]
+ *   0x4060         PK_S    read: the packing's s (the input's exponent is
+ *                  s - 15)
  *   X reads (0x0000-0x1fff) return the input vector, when idle (tests)
  *
  * The GLU unit (glu_spec() in fw/common/eng_spec.h) turns bank 0 (gate)
@@ -62,7 +73,8 @@
 
 module mlm_engine #(
 	parameter ADDR_BITS = 29,         // byte address bits of main memory
-	parameter FIFO_LOG = 5            // data FIFO: 2^FIFO_LOG blocks
+	parameter FIFO_LOG = 5,           // data FIFO: 2^FIFO_LOG blocks
+	parameter RAM_AW = 15             // the CPU's RAM: word address bits
 ) (
 	input wire clk,
 	input wire rst,
@@ -86,16 +98,16 @@ module mlm_engine #(
 
 	output wire busy_o,
 
-	// the result mirror (in the SOC, read on the CPU's clock): a copy-out
-	// writes OUT32 values of consecutive rows here
-	output reg mir_we,
-	output reg [10:0] mir_wa,
-	output reg [31:0] mir_wd,
-
-	// the input staging RAM (in the SOC, written on the CPU's clock): a
-	// copy-in moves its words into X and the block offsets
-	output reg [9:0] xs_ra,
-	input wire [31:0] xs_q
+	// the CPU's RAM, its second port (rtl/mlm_soc.v; word addresses): a
+	// copy-out writes OUT32 values of consecutive rows into it, the
+	// packer reads the int32 vector it MX-packs into X from it (the
+	// data the third cycle after pb_ra)
+	output reg pb_we,
+	output reg [RAM_AW-1:0] pb_wa,
+	output reg [31:0] pb_wd,
+	output reg [RAM_AW-1:0] pb_ra,
+	input wire [31:0] pb_q,
+	output wire pb_busy              // a copy-out or the packer is using the port
 );
 
 	// The bus, registered on the way in (the decode below is otherwise a
@@ -145,20 +157,21 @@ module mlm_engine #(
 	reg [31:0] glu_xdata;
 	reg [6:0] glu_dblk;
 	reg [3:0] glu_ddata;
-	// copy-in (CI_GO): staging words 0 .. nv-1 into X (word w: bank
-	// w[3:0], entry w[9:4]), then words 768 .. 768 + nb - 1 into the
-	// offsets; a word a cycle
-	wire ci_xwe, ci_dwe;
-	wire [9:0] ci_xw;
-	wire [6:0] ci_db;
+	// the packer's writes (PK_GO): X word w (bank w[3:0], entry w[9:4])
+	// and block b's offset
+	reg ci_xwe, ci_dwe;
+	reg [9:0] ci_xw;
+	reg [6:0] ci_db;
+	reg [31:0] pk_xd;
+	reg [3:0] pk_dd;
 	wire x_we = x_we_bus || glu_xwe || ci_xwe;
 	wire [3:0] x_wbank = ci_xwe ? ci_xw[3:0] : glu_xwe ? glu_xbank : bus_adr[5:2];
 	wire [5:0] x_wentry = ci_xwe ? ci_xw[9:4] : glu_xwe ? glu_xentry : bus_adr[11:6];
 	wire [3:0] x_wsel = (ci_xwe || glu_xwe) ? 4'hf : bus_sel;
-	wire [31:0] x_wdat = ci_xwe ? xs_q : glu_xwe ? glu_xdata : bus_wdat;
+	wire [31:0] x_wdat = ci_xwe ? pk_xd : glu_xwe ? glu_xdata : bus_wdat;
 	wire xd_we = xd_we_bus || glu_dwe || ci_dwe;
 	wire [6:0] xd_wblk = ci_dwe ? ci_db : glu_dwe ? glu_dblk : bus_adr[8:2];
-	wire [3:0] xd_wdat = ci_dwe ? xs_q[3:0] : glu_dwe ? glu_ddata : bus_wdat[3:0];
+	wire [3:0] xd_wdat = ci_dwe ? pk_dd : glu_dwe ? glu_ddata : bus_wdat[3:0];
 	reg [5:0] x_raddr;
 	reg [5:0] xb_raddr;              // test read-back of X
 	reg xb_rd;
@@ -237,10 +250,11 @@ module mlm_engine #(
 	always @(*) begin
 		rg_mux = 32'd0;
 		if (rg_sel[5] && rg_sel[4]) begin
-			if (rg_sel[1:0] == 2'd1) rg_mux = {16'd0, glu_xsh, glu_psh};
+			if (rg_sel[3:0] == 4'd1) rg_mux = {16'd0, glu_xsh, glu_psh};
+			if (rg_sel[3:0] == 4'd8) rg_mux = {26'd0, pk_s};
 		end else if (rg_sel[5]) case (rg_sel[3:0])
-			4'd5: rg_mux = {29'd0, ci_go | ci_on | ci_xwe | ci_dwe,               // bit 2: copy-in
-			                co_go | co_on | co_v1 | co_v1b | co_v2 | mir_we,   // bit 1: copy-out
+			4'd5: rg_mux = {29'd0, pk_busy,                                       // bit 2: the packer
+			                co_go | co_on | co_v1 | co_v1b | co_v2 | pb_we,    // bit 1: copy-out
 			                busy | glu_busy | glu_go};
 			4'd6: rg_mux = r_cycles;
 			4'd7: rg_mux = r_waits;
@@ -254,57 +268,195 @@ module mlm_engine #(
 		endcase
 	end
 	reg [511:0] xb_hold;             // the X RAM's output, registered before the bank mux
-	reg ci_go, ci_on, ci_ph;           // ci_ph: 0 values, 1 offsets
-	reg [9:0] ci_nv, ci_k;
-	reg [6:0] ci_nb;
-	reg ci_rv;                         // a staging read is in flight (its data next cycle)
-	reg ci_rph;
-	reg [9:0] ci_rk;
+	// ---------------------------------------------------------------
+	// the packer: eng_mx_pack (fw/common/eng_spec.h) in hardware, one
+	// element a cycle in each of two passes over v in the RAM.
+	//   pass 1: per block of 32, mx = max |v[i]| (i < n), s_b =
+	//           max(bitlen(mx) - 7, 0); s = max s_b
+	//   pass 2: per block, sh = max(s - 15, s_b), offset s - sh; each
+	//           value rshr32(v[i], sh) clamped to +-127 (0 from n on),
+	//           four to an X word, the offset after the block's last
+	// Reads: pb_ra at a cycle, its data the third cycle after (the RAM
+	// registers its output, the SOC again); the tags travel alongside.
+	reg ci_go;
+	reg [12:0] pk_n;
+	reg [6:0] pk_nb;
+	reg [RAM_AW-1:0] pk_src, co_dst;
+	reg [2:0] pk_ph;                  // 0 idle, 1 pass 1, 2 drain, 3 pass 2, 4 drain
+	reg [11:0] pk_i;
+	reg [3:0] pk_dr;
+	reg [5:0] pk_s;
+	reg [4:0] pk_bx [0:127];          // s_b per block
+	reg [4:0] pk_sh;                  // pass 2: this block's shift and offset
+	reg [3:0] pk_off;
+	// tags: valid, in range, element of block, block
+	reg t1_v, t1_in, t2_v, t2_in, t3_v, t3_in, a_v, a_in;
+	reg [4:0] t1_k, t2_k, t3_k, a_k;
+	reg [6:0] t1_b, t2_b, t3_b, a_b;
+	reg [4:0] t1_sh, t2_sh, t3_sh;
+	reg [3:0] t1_off, t2_off, t3_off, a_off;
+	reg p2_t1, p2_t2, p2_t3;          // the tag is pass 2's
+	reg [31:0] mx, mxb;               // pass 1: this block's max so far, a block's
+	reg bd, bd2;
+	reg [6:0] bd_b, bd2_b;
+	reg [4:0] pk_sbr;
+	wire [11:0] pk_last = {pk_nb, 5'd0} - 12'd1;
+	// bit length as a balanced tree (a priority chain is a long path)
+	function [2:0] pk_bl4;
+		input [3:0] v;
+		pk_bl4 = v[3] ? 3'd4 : v[2] ? 3'd3 : v[1] ? 3'd2 : v[0] ? 3'd1 : 3'd0;
+	endfunction
+	function [3:0] pk_bl8;
+		input [7:0] v;
+		pk_bl8 = (v[7:4] != 4'd0) ? {1'b0, pk_bl4(v[7:4])} + 4'd4 : {1'b0, pk_bl4(v[3:0])};
+	endfunction
+	function [4:0] pk_bl16;
+		input [15:0] v;
+		pk_bl16 = (v[15:8] != 8'd0) ? {1'b0, pk_bl8(v[15:8])} + 5'd8 : {1'b0, pk_bl8(v[7:0])};
+	endfunction
+	function [5:0] pk_bl32;
+		input [31:0] v;
+		pk_bl32 = (v[31:16] != 16'd0) ? {1'b0, pk_bl16(v[31:16])} + 6'd16 : {1'b0, pk_bl16(v[15:0])};
+	endfunction
+	// pass 2: s - 15 against s_b of the next block (pk_bn), read from the
+	// table a block ahead into a register
+	reg [6:0] pk_bn;
+	reg [4:0] pk_bxn;
+	reg signed [6:0] pk_s15;
 	always @(posedge clk) begin
-		ci_rv <= 1'b0;
+		pk_bxn <= pk_bx[pk_bn];
+		pk_s15 <= $signed({1'b0, pk_s}) - 7'sd15;
+	end
+	function [4:0] pk_shof;
+		input [4:0] sb; input signed [6:0] s15;
+		pk_shof = (s15 > $signed({2'b00, sb})) ? s15[4:0] : sb;
+	endfunction
+	wire [4:0] pk_shn = pk_shof(pk_bxn, pk_s15);
+	always @(posedge clk) begin
+		t1_v <= 1'b0;
 		if (rst) begin
-			ci_on <= 1'b0;
-		end else begin
-			if (ci_go && !ci_on) begin
-				ci_on <= 1'b1;
-				ci_k <= 10'd0;
-				ci_ph <= (ci_nv == 10'd0);
-			end else if (ci_on) begin
-				// a read now; the write with its data next cycle
-				xs_ra <= ci_ph ? (10'd768 + ci_k) : ci_k;
-				ci_rv <= 1'b1;
-				ci_rph <= ci_ph;
-				ci_rk <= ci_k;
-				if (!ci_ph && ci_k + 10'd1 == ci_nv) begin
-					ci_k <= 10'd0;
-					ci_ph <= 1'b1;
-					if (ci_nb == 7'd0) ci_on <= 1'b0;
-				end else if (ci_ph && ci_k[6:0] + 7'd1 == ci_nb) begin
-					ci_on <= 1'b0;
-				end else ci_k <= ci_k + 10'd1;
+			pk_ph <= 3'd0;
+		end else case (pk_ph)
+		3'd0: if (ci_go) begin
+			pk_ph <= (pk_nb == 7'd0) ? 3'd0 : 3'd1;
+			pk_i <= 12'd0;
+			pk_s <= 6'd0;
+		end
+		3'd1, 3'd3: begin
+			pb_ra <= pk_src + {{(RAM_AW-12){1'b0}}, pk_i};
+			t1_v <= 1'b1;
+			t1_in <= ({1'b0, pk_i} < pk_n);
+			t1_k <= pk_i[4:0];
+			t1_b <= pk_i[11:5];
+			t1_sh <= pk_sh;
+			t1_off <= pk_off;
+			p2_t1 <= (pk_ph == 3'd3);
+			if (pk_ph == 3'd3 && pk_i[4:0] == 5'd31) begin
+				// the next block's shift (its s_b is final: pass 1 is done)
+				pk_sh <= pk_shn;
+				pk_off <= pk_s[3:0] - pk_shn[3:0];
+				pk_bn <= pk_bn + 7'd1;
+			end
+			if (pk_i == pk_last) begin
+				pk_ph <= pk_ph + 3'd1;
+				pk_dr <= 4'd8;
+				pk_bn <= 7'd0;             // pass 2's first block
+			end else pk_i <= pk_i + 12'd1;
+		end
+		3'd2, 3'd4: if (pk_dr != 4'd0) pk_dr <= pk_dr - 4'd1;
+		else if (pk_ph == 3'd2) begin
+			pk_ph <= 3'd3;
+			pk_i <= 12'd0;
+			pk_sh <= pk_shn;           // block 0's (pk_bn has been 0 all the drain)
+			pk_off <= pk_s[3:0] - pk_shn[3:0];
+			pk_bn <= 7'd1;
+		end else pk_ph <= 3'd0;
+		default: pk_ph <= 3'd0;
+		endcase
+		// pass 1's end of a block: s_b into the table, s the largest
+		if (bd2) begin
+			pk_bx[bd2_b] <= pk_sbr;
+			if ({1'b0, pk_sbr} > pk_s) pk_s <= {1'b0, pk_sbr};
+		end
+	end
+	// the data: pb_q is t3's
+	reg p2_a;
+	reg [31:0] a_ab;                  // pass 1: |v|
+	reg signed [31:0] a_r1;           // pass 2: v >>> (sh - 1), or v for sh 0
+	reg a_sh0;
+	always @(posedge clk) begin
+		t2_v <= t1_v && !rst; t2_in <= t1_in; t2_k <= t1_k; t2_b <= t1_b;
+		t2_sh <= t1_sh; t2_off <= t1_off; p2_t2 <= p2_t1;
+		t3_v <= t2_v && !rst; t3_in <= t2_in; t3_k <= t2_k; t3_b <= t2_b;
+		t3_sh <= t2_sh; t3_off <= t2_off; p2_t3 <= p2_t2;
+		a_v <= t3_v && !rst; a_in <= t3_in; a_k <= t3_k; a_b <= t3_b; a_off <= t3_off; p2_a <= p2_t3;
+		begin : pk_a
+			reg signed [31:0] x;
+			x = t3_in ? $signed(pb_q) : 32'sd0;
+			a_ab <= x[31] ? (~x + 32'd1) : x;
+			a_sh0 <= (t3_sh == 5'd0);
+			a_r1 <= (t3_sh == 5'd0) ? x : (x >>> (t3_sh - 5'd1));
+		end
+	end
+	// pass 1: the block's max, then s_b
+	wire [31:0] mx_new = (a_k == 5'd0 || a_ab > mx) ? a_ab : mx;
+	always @(posedge clk) begin
+		bd <= 1'b0;
+		bd2 <= 1'b0;
+		if (a_v && !p2_a) begin
+			mx <= mx_new;
+			if (a_k == 5'd31) begin bd <= !rst; bd_b <= a_b; mxb <= mx_new; end
+		end
+		if (bd) begin
+			bd2 <= !rst;
+			bd2_b <= bd_b;
+			pk_sbr <= (pk_bl32(mxb) > 6'd7) ? pk_bl32(mxb) - 6'd7 : 5'd0;
+		end
+	end
+	// pass 2: round, then clamp, then four bytes to a word
+	reg r_v, b_v;
+	reg [4:0] r_k, b_k;
+	reg [6:0] r_b, b_b;
+	reg [3:0] r_off, b_off;
+	reg signed [31:0] r_r;
+	reg [7:0] b_byte;
+	reg [23:0] wbuf;
+	always @(posedge clk) begin
+		r_v <= a_v && p2_a && !rst;
+		r_k <= a_k; r_b <= a_b; r_off <= a_off;
+		r_r <= a_sh0 ? a_r1 : ((a_r1 + 32'sd1) >>> 1);
+		b_v <= r_v && !rst;
+		b_k <= r_k; b_b <= r_b; b_off <= r_off;
+		b_byte <= (r_r > 32'sd127) ? 8'd127 : (r_r < -32'sd127) ? 8'h81 : r_r[7:0];
+		ci_xwe <= 1'b0;
+		ci_dwe <= 1'b0;
+		if (b_v) begin
+			case (b_k[1:0])
+			2'd0: wbuf[7:0] <= b_byte;
+			2'd1: wbuf[15:8] <= b_byte;
+			2'd2: wbuf[23:16] <= b_byte;
+			default: begin
+				ci_xwe <= 1'b1;
+				ci_xw <= {b_b, b_k[4:2]};
+				pk_xd <= {b_byte, wbuf};
+			end
+			endcase
+			if (b_k == 5'd31) begin
+				ci_dwe <= 1'b1;
+				ci_db <= b_b;
+				pk_dd <= b_off;
 			end
 		end
 	end
-	// xs_ra registered at c (valid c + 1); the RAM's q at c + 2: the
-	// write goes out in that cycle, straight from the delayed request
-	reg ci_rv_d, ci_rph_d;
-	reg [9:0] ci_rk_d;
-	always @(posedge clk) begin
-		ci_rv_d <= ci_rv && !rst;
-		ci_rph_d <= ci_rph;
-		ci_rk_d <= ci_rk;
-	end
-	assign ci_xwe = ci_rv_d && !ci_rph_d;
-	assign ci_dwe = ci_rv_d && ci_rph_d;
-	assign ci_xw = ci_rk_d;
-	assign ci_db = ci_rk_d[6:0];
+	wire pk_busy = (pk_ph != 3'd0) || ci_go || t1_v || t2_v || t3_v || a_v || r_v || b_v || ci_xwe || ci_dwe;
 
 	reg co_go;
 	reg [11:0] co_n;
+	assign pb_busy = pk_busy || co_go || co_on || co_v1 || co_v1b || co_v2 || pb_we;
 	// one row a cycle: address, then out_q (+ rounding), then the shift
 	wire [63:0] co_rnd = (r_shift == 6'd0) ? 64'd0 : (64'd1 << (r_shift - 6'd1));
 	always @(posedge clk) begin
-		mir_we <= 1'b0;
+		pb_we <= 1'b0;
 		co_v1 <= 1'b0;
 		co_v1b <= 1'b0;
 		co_v2 <= 1'b0;
@@ -337,9 +489,9 @@ module mlm_engine #(
 				co_sum <= co_q + co_rnd;
 			end
 			if (co_v2) begin
-				mir_we <= 1'b1;
-				mir_wa <= co_k2;
-				mir_wd <= ($signed(co_sum) >>> r_shift);
+				pb_we <= 1'b1;
+				pb_wa <= co_dst + {{(RAM_AW-11){1'b0}}, co_k2};
+				pb_wd <= ($signed(co_sum) >>> r_shift);
 			end
 		end
 	end
@@ -434,18 +586,27 @@ module mlm_engine #(
 				bus_rdat <= 32'd0;
 				if (bus_adr[16:14] == 3'b001 && bus_adr[6]) begin
 					// 0x4040 GLU_GO, 0x4044 GLU_RES, 0x4048 CO_GO, 0x404c CO_ROW
-					case (bus_adr[3:2])
-					2'd0: if (bus_we && bus_adr[5:4] == 2'b00) glu_go <= 1'b1;
+					// (0x4040-0x404c: bits 5:4 are 00, the registers
+					// above 0x4050 must not alias them)
+					if (bus_adr[5:4] == 2'b00) case (bus_adr[3:2])
+					2'd0: if (bus_we) glu_go <= 1'b1;
 					2'd2: if (bus_we) co_go <= 1'b1;
-					default: if (bus_we) co_row <= bus_wdat[12:0];
+					2'd3: if (bus_we) co_row <= bus_wdat[12:0];
+					default: ;
 					endcase
-					if (bus_we && bus_adr[3:2] == 2'd2) co_n <= bus_wdat[11:0];
-					// 0x4050 CI_GO: nv (bits 9:0) value words, nb (22:16) offsets
-					if (bus_we && bus_adr[5:4] == 2'b01 && bus_adr[3:2] == 2'd0) begin
+					if (bus_we && bus_adr[5:2] == 4'd2) co_n <= bus_wdat[11:0];
+					// 0x4050 PK_GO: n (bits 12:0), blocks (22:16);
+					// 0x4054 CO_DST, 0x4058 PK_SRC
+					if (bus_we && bus_adr[5:4] == 2'b01) case (bus_adr[3:2])
+					2'd0: begin
 						ci_go <= 1'b1;
-						ci_nv <= bus_wdat[9:0];
-						ci_nb <= bus_wdat[22:16];
+						pk_n <= bus_wdat[12:0];
+						pk_nb <= bus_wdat[22:16];
 					end
+					2'd1: co_dst <= bus_wdat[RAM_AW-1:0];
+					2'd2: pk_src <= bus_wdat[RAM_AW-1:0];
+					default: ;
+					endcase
 				end else if (bus_adr[16:14] == 3'b001) begin
 					case (bus_adr[5:2])
 					4'd0: if (bus_we) r_addr <= bus_wdat[ADDR_BITS-1:0];

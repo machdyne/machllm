@@ -56,20 +56,6 @@ static uint32_t rd32u(const uint8_t *p)
 
 static uint8_t *MEM(uint32_t off) { return plat_mem() + off; }
 
-/* n words, eight loads then eight stores at a time: the CPU waits on
- * each load's answer, so the loop's own instructions are what this saves */
-static void cp_words(uint32_t *d, const volatile uint32_t *s, uint32_t n)
-{
-	uint32_t k = 0;
-	for (; k + 8 <= n; k += 8) {
-		uint32_t a0 = s[k], a1 = s[k + 1], a2 = s[k + 2], a3 = s[k + 3];
-		uint32_t a4 = s[k + 4], a5 = s[k + 5], a6 = s[k + 6], a7 = s[k + 7];
-		d[k] = a0; d[k + 1] = a1; d[k + 2] = a2; d[k + 3] = a3;
-		d[k + 4] = a4; d[k + 5] = a5; d[k + 6] = a6; d[k + 7] = a7;
-	}
-	for (; k < n; k++) d[k] = s[k];
-}
-
 static void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)MEM(off) = v; }
 
 /* sqrt(v) to 16 bits or more: v is brought under 2^32 by k pairs of
@@ -107,6 +93,10 @@ uint32_t mlm_exp_neg_q16(uint32_t x)
 /* buffers                                                          */
 
 static int32_t H[MLM_MAX_DIM];          /* residual stream */
+/* max |H[i]|, as the last residual() into H left it (h_max_ok): the
+ * norm that follows needs no pass of its own to find it */
+static uint32_t h_max;
+static int h_max_ok;
 static int32_t S[MLM_MAX_SCRATCH];      /* q|k|v, norm out, ffn */
 static int32_t ATT[MLM_MAX_CTX];        /* scores, then exp, then coef */
 /* this KV head's K and V scales, copied from main memory once for the
@@ -114,6 +104,11 @@ static int32_t ATT[MLM_MAX_CTX];        /* scores, then exp, then coef */
 static uint32_t KS[MLM_MAX_CTX], VS[MLM_MAX_CTX];
 static uint32_t ks_row = ~0u, ks_n;
 static int vs_emax;
+/* per cache row (layer x KV head), the largest V-scale exponent of the
+ * positions stored so far (kept as they are stored; attend() needs it
+ * and would otherwise scan them all) */
+#define VEM_ROWS 512
+static int16_t VEM[VEM_ROWS];
 
 static int eqh[MLM_MAX_HEADS], ekh[MLM_MAX_HEADS], eoh[MLM_MAX_HEADS];
 static int32_t qf[MLM_MAX_HEADS], kf[MLM_MAX_HEADS];   /* deferred QK-norm factors (0: none) */
@@ -201,28 +196,6 @@ static void v_mulshr30(int32_t *d, const int32_t *a, int n, int32_t k)
 	for (int i = 0; i < n; i++) d[i] = (int32_t)rshr64((int64_t)a[i] * k, 30);
 }
 
-/* int16 pairs for the engine's input: word j holds elements 2j and
- * 2j+1 of a >> sh, clamped to +-32767, zero from n on; padn/2 words
- * (padn even) */
-static void v_qpack(uint32_t *d, const int32_t *a, int n, int sh, int padn)
-{
-	if (mlm_vu) { mlm_vu(MLM_VU_QPACK, a, 0, d, (uint32_t)n, sh, padn, 0); return; }
-	for (int i = 0; i < padn; i += 2) {
-		int32_t x = 0, y = 0;
-		if (i < n) {
-			x = rshr32(a[i], sh);
-			if (x > 32767) x = 32767;
-			if (x < -32767) x = -32767;
-		}
-		if (i + 1 < n) {
-			y = rshr32(a[i + 1], sh);
-			if (y > 32767) y = 32767;
-			if (y < -32767) y = -32767;
-		}
-		d[i >> 1] = ((uint32_t)x & 0xffff) | ((uint32_t)y << 16);
-	}
-}
-
 /* int8 for the KV cache: ((a[i] >> s) r) >> 16, clamped to +-127, four
  * to a word, lowest byte first (n a multiple of 4) */
 static void v_kvq8(uint32_t *d, const int32_t *a, int n, int s, int32_t r)
@@ -255,15 +228,13 @@ static void v_rope(int32_t *v, const int16_t *rt, int hd, int split)
 	}
 }
 
-/* the norm weights, copied from main memory once per use (32-bit reads) */
-/* (read when needed: fetching them while the engine streams was tried
- * and slows the engine by as much as it saves) */
+/* the norm weights, copied from main memory once per use (the DMA unit
+ * when the engine is idle; fetching them while it streams was tried and
+ * slows the engine by as much as it saves) */
 static const int16_t *norm_w(const mlm_norm_t *nw)
 {
 	if (nw->off != nw_off) {
-		const volatile uint32_t *src = (const volatile uint32_t *)MEM(nw->off);
-		uint32_t *d = (uint32_t *)NW, nwd = (nw->n + 1) / 2;
-		cp_words(d, src, nwd);
+		plat_mem_rd(NW, nw->off, (nw->n + 1) / 2);
 		nw_off = nw->off;
 	}
 	return NW;
@@ -292,83 +263,26 @@ static int32_t v_attsc(int32_t *a, const uint32_t *b, int n, int k0)
 	return smax;
 }
 
-/* softmax numerators: a[t] = exp(a[t] - p0) in Q16 (p0 the largest);
- * returns their sum */
-static uint64_t v_expsum(int32_t *a, int n, int32_t smax)
+/* softmax numerators with the V scales folded in, one pass: a[t] =
+ * exp(a[t] - smax) (Q16), *sum their sum, then a[t] times the mantissa
+ * of b[t] shifted right by vemax - its exponent; returns the largest */
+static uint32_t v_expcoef(int32_t *a, const uint32_t *b, int n, int32_t smax, int vemax, uint64_t *sum)
 {
-	if (mlm_vu) { uint64_t s; mlm_vu(MLM_VU_EXPSUM, a, 0, a, (uint32_t)n, smax, 0, &s); return s; }
-	uint64_t sum = 0;
-	for (int t = 0; t < n; t++) {
-		uint32_t e = mlm_exp_neg_q16((uint32_t)(smax - a[t]));
-		a[t] = (int32_t)e;
-		sum += e;
-	}
-	return sum;
-}
-
-/* the V scales folded in: a[t] = a[t] times the mantissa of b[t],
- * shifted right by p0 - its exponent (p0 the largest); returns the
- * largest (unsigned) */
-static uint32_t v_coef(int32_t *a, const uint32_t *b, int n, int vemax)
-{
-	if (mlm_vu) return mlm_vu(MLM_VU_COEF, a, b, a, (uint32_t)n, vemax, 0, 0);
+	if (mlm_vu) return mlm_vu(MLM_VU_EXPCOEF, a, b, a, (uint32_t)n, smax, vemax, sum);
+	uint64_t s = 0;
 	uint32_t cmax = 0;
 	for (int t = 0; t < n; t++) {
+		uint32_t e = mlm_exp_neg_q16((uint32_t)(smax - a[t]));
+		s += e;
 		uint32_t w = b[t];
 		int d = vemax - (int16_t)(w >> 16);
-		uint64_t c = (uint64_t)(uint32_t)a[t] * (w & 0xffff);
+		uint64_t c = (uint64_t)e * (w & 0xffff);
 		c = (d > 63) ? 0 : (c >> d);
 		a[t] = (int32_t)(uint32_t)c;
 		if ((uint32_t)c > cmax) cmax = (uint32_t)c;
 	}
+	*sum = s;
 	return cmax;
-}
-
-/* as v_qpack, for unsigned values: (uint32) a[i] >> sh (64-bit,
- * rounded), at most 32767 */
-static void v_qpacku(uint32_t *d, const int32_t *a, int n, int sh, int padn)
-{
-	if (mlm_vu) { mlm_vu(MLM_VU_QPACKU, a, 0, d, (uint32_t)n, sh, padn, 0); return; }
-	for (int i = 0; i < padn; i += 2) {
-		uint32_t x = 0, y = 0;
-		if (i < n) { int64_t c = rshr64((int64_t)(uint32_t)a[i], sh); x = c > 32767 ? 32767 : (uint32_t)c; }
-		if (i + 1 < n) { int64_t c = rshr64((int64_t)(uint32_t)a[i + 1], sh); y = c > 32767 ? 32767 : (uint32_t)c; }
-		d[i >> 1] = x | (y << 16);
-	}
-}
-
-/* eng_mx_pack (eng_spec.h) as the vector unit's MXPACK: the int8 values
- * four to a d word, block b's offset in bx[b]; returns s (the input's
- * exponent is s - 15) */
-static uint32_t v_mxpack(uint32_t *d, uint32_t *bx, const int32_t *a, int n, int padn)
-{
-	if (mlm_vu) return mlm_vu(MLM_VU_MXPACK, a, bx, d, (uint32_t)n, 0, padn, 0);
-	int nb = padn / 32, s = 0;
-	for (int b = 0; b < nb; b++) {
-		uint32_t mx = 0;
-		for (int k = 0; k < 32 && 32 * b + k < n; k++)
-			if (uabs32(a[32 * b + k]) > mx) mx = uabs32(a[32 * b + k]);
-		int sb = bitlen64(mx) - 7;
-		if (sb < 0) sb = 0;
-		bx[b] = (uint32_t)sb;
-		if (sb > s) s = sb;
-	}
-	for (int b = 0; b < nb; b++) {
-		int sh = (s - 15 > (int)bx[b]) ? s - 15 : (int)bx[b];
-		bx[b] = (uint32_t)(s - sh);
-		for (int w = 0; w < 8; w++) {
-			uint32_t word = 0;
-			for (int j = 0; j < 4; j++) {
-				int i = 32 * b + 4 * w + j;
-				int32_t x = (i < n) ? rshr32(a[i], sh) : 0;
-				if (x > 127) x = 127;
-				if (x < -127) x = -127;
-				word |= (uint32_t)(uint8_t)x << (8 * j);
-			}
-			d[8 * b + w] = word;
-		}
-	}
-	return (uint32_t)s;
 }
 
 /* the C loops themselves, whatever mlm_vu is: for tests of the unit */
@@ -385,14 +299,10 @@ uint32_t mlm_vu_ref(int op, const void *a, const void *b, void *d, uint32_t n,
 	case MLM_VU_RSHR: v_rshr((int32_t *)d, (const int32_t *)a, (int)n, p0); break;
 	case MLM_VU_RESID: r = v_resid((int32_t *)d, (const int32_t *)b, (int)n, p0, p1); break;
 	case MLM_VU_MULSHR30: v_mulshr30((int32_t *)d, (const int32_t *)a, (int)n, p0); break;
-	case MLM_VU_QPACK: v_qpack((uint32_t *)d, (const int32_t *)a, (int)n, p0, p1); break;
 	case MLM_VU_KVQ8: v_kvq8((uint32_t *)d, (const int32_t *)a, (int)n, p0, p1); break;
 	case MLM_VU_ROPE: v_rope((int32_t *)d, (const int16_t *)b, (int)n, p0); break;
 	case MLM_VU_ATTSC: r = (uint32_t)v_attsc((int32_t *)d, (const uint32_t *)b, (int)n, p0); break;
-	case MLM_VU_EXPSUM: *sum = v_expsum((int32_t *)d, (int)n, p0); break;
-	case MLM_VU_COEF: r = v_coef((int32_t *)d, (const uint32_t *)b, (int)n, p0); break;
-	case MLM_VU_QPACKU: v_qpacku((uint32_t *)d, (const int32_t *)a, (int)n, p0, p1); break;
-	case MLM_VU_MXPACK: r = v_mxpack((uint32_t *)d, (uint32_t *)b, (const int32_t *)a, (int)n, p1); break;
+	case MLM_VU_EXPCOEF: r = v_expcoef((int32_t *)d, (const uint32_t *)b, (int)n, p0, p1, sum); break;
 	default: break;
 	}
 	mlm_vu = save;
@@ -439,19 +349,15 @@ static int out_to_i32(int32_t *dst, int n, int eacc)
 	return eacc + sh;
 }
 
-/* int32 vector -> the engine's input, MX-packed (eng_mx_pack): int8
- * four to a write, one exponent word per block of 32; zero pads to padn
- * (a multiple of 32); returns the input's exponent */
+/* int32 vector -> the engine's input, MX-packed (eng_mx_pack; the
+ * firmware: the engine's packer, which reads v from the RAM); zero pads
+ * to padn (a multiple of 32); returns the input's exponent */
 #define PAD128(n) (((n) + 127) & ~127)   /* a 1-bit tensor's input: whole groups */
-static uint32_t XQ[ENG_X_MAX / 4];      /* to_x: the int8 values on their way to X */
-static uint8_t XD[ENG_X_MAX / 32];
-static uint32_t XDW[ENG_X_MAX / 32];   /* the offsets as words (MXPACK's B) */
 static int to_x(const int32_t *v, int n, int e, int padn)
 {
 	int ps = plat_prof_cur();
 	plat_prof(MLM_PROF_PACK);
-	int sx = (int)v_mxpack(XQ, XDW, v, n, padn) - 15;
-	plat_eng_xload(XQ, padn / 4, XDW, padn / 32);
+	int sx = plat_eng_xpack(v, n, padn);
 	plat_prof(ps);
 	return e + sx;
 }
@@ -479,7 +385,7 @@ static int rmsnorm(mlm_ctx_t *m, int32_t *dst, const int32_t *src, int n,
 {
 	const mlm_header_t *hd = m->hdr;
 	const int16_t *g = norm_w(nw);
-	int s = bitlen64(v_maxabs(src, n)) - 15;
+	int s = bitlen64((src == H && h_max_ok) ? h_max : v_maxabs(src, n)) - 15;
 	if (s < 0) s = 0;
 	uint64_t ss = v_sqmul(dst, src, g, n, s);
 	uint64_t ms;
@@ -552,11 +458,14 @@ uint32_t mlm_glu_check(uint32_t n, int sg, int su, int sq)
 	uint32_t bad = (cp != hp);
 	(void)cx;
 	const volatile uint32_t *xw = plat_eng_x(), *xdw = plat_eng_xd();
-	int sx = eng_mx_pack(S, (int)n, (int)n, (int8_t *)XQ, XD);
-	if (sx != cx - (bitlen64(0) - 15) && 0) bad++;
+	/* the packing's scratch: S beyond the n products (n <= 3072) */
+	uint32_t *xq = (uint32_t *)(S + ENG_X_MAX);
+	uint8_t *xd = (uint8_t *)(xq + ENG_X_MAX / 4);
+	if (n > ENG_X_MAX) return 1;
+	int sx = eng_mx_pack(S, (int)n, (int)n, (int8_t *)xq, xd);
 	bad += (sx != hx);
-	for (uint32_t i = 0; i < n / 4; i++) bad += (xw[i] != XQ[i]);
-	for (uint32_t b = 0; b < n / 32; b++) bad += ((xdw[b] & 15) != XD[b]);
+	for (uint32_t i = 0; i < n / 4; i++) bad += (xw[i] != xq[i]);
+	for (uint32_t b = 0; b < n / 32; b++) bad += ((xdw[b] & 15) != xd[b]);
 	return bad;
 }
 
@@ -589,100 +498,144 @@ static uint32_t kv_quant(const int32_t *v, int n, int e, int8_t *q, int32_t mul)
 	return (uint32_t)sm | ((uint32_t)(se & 0xffff) << 16);
 }
 
-static void kv_store(mlm_ctx_t *m, int l, int kh, const int32_t *k, int ek, int32_t kmul,
-                     const int32_t *v, int ev)
+/* this position's K and V for every KV head of layer l: per head the
+ * K row (headers, values, padding: k_stride bytes) and the V column (a
+ * byte per dimension, v_stride apart) are built in the RAM and written
+ * by the DMA unit, while the next head is quantised into the other
+ * buffer; the scales after the last. */
+static uint32_t KB[2][(16 + 256 + 32) / 4], VB[2][256 / 4];
+static void kv_store_all(mlm_ctx_t *m, int l, const int32_t *k, const int *ek, const int32_t *kmul,
+                         const int32_t *v, int ev)
 {
 	const mlm_header_t *hd = m->hdr;
-	int n = hd->head_dim, hp = m->hd_pad;
-	uint32_t row = (uint32_t)(l * hd->n_kv_heads + kh);
+	int n = hd->head_dim, hp = m->hd_pad, nkv = hd->n_kv_heads;
+	uint32_t ks[MLM_MAX_HEADS], vs[MLM_MAX_HEADS];
 	uint32_t qw[64];                    /* word aligned for v_kvq8 */
 	int8_t *q = (int8_t *)qw;
-
-	/* K: one row per position, Q8 chunks with multipliers of 1 */
-	uint32_t ks = kv_quant(k, n, ek, q, kmul);
-	for (int i = n; i < hp; i++) q[i] = 0;
-	uint32_t a = m->kcache + (row * m->ctx + m->pos) * m->k_stride;
-	for (int g = 0; g < hp / 32; g++) {
-		if ((g & 3) == 0) {
-			wr32(a, 0x00010001u); wr32(a + 4, 0x00010001u); a += 8;
-		}
-		for (int w = 0; w < 8; w++, a += 4) {
-			const uint8_t *b = (const uint8_t *)&q[g * 32 + w * 4];
-			wr32(a, (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
-			        ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
-		}
-	}
-	wr32(m->kscale + (row * m->ctx + m->pos) * 4, ks);
-
-	/* V: transposed, one row per dimension, one byte per position */
-	uint32_t vs = kv_quant(v, n, ev, q, 0);
 	uint32_t col = (m->pos / 128) * 136 + 8 + (m->pos % 128);
-	uint32_t base = m->vcache + row * n * m->v_stride + col;
-	for (int d = 0; d < n; d++)
-		*(volatile uint8_t *)MEM(base + d * m->v_stride) = (uint8_t)q[d];
-	wr32(m->vscale + (row * m->ctx + m->pos) * 4, vs);
-	ks_row = ~0u;                       /* the copies above are stale now */
+	for (int i = 0; i < nkv; i++) {
+		uint32_t row = (uint32_t)(l * nkv + i);
+		uint32_t *kb = KB[i & 1];
+		/* K: one row per position, Q8 chunks with multipliers of 1 */
+		ks[i] = kv_quant(k + i * n, n, ek[i], q, kmul[i]);
+		for (int j = n; j < hp; j++) q[j] = 0;
+		uint32_t w = 0;
+		for (int g = 0; g < hp / 32; g++) {
+			if ((g & 3) == 0) { kb[w++] = 0x00010001u; kb[w++] = 0x00010001u; }
+			for (int j = 0; j < 8; j++) kb[w++] = qw[g * 8 + j];
+		}
+		while (w < m->k_stride / 4) kb[w++] = 0;
+		/* V: transposed, one row per dimension, one byte per position */
+		vs[i] = kv_quant(v + i * n, n, ev, (int8_t *)VB[i & 1], 0);
+		plat_mem_wblk(m->kcache + (row * m->ctx + m->pos) * m->k_stride, kb, m->k_stride / 16);
+		plat_mem_wcol(m->vcache + row * n * m->v_stride + col, VB[i & 1], (uint32_t)n, m->v_stride);
+	}
+	plat_dma_wait();
+	for (int i = 0; i < nkv; i++) {
+		uint32_t row = (uint32_t)(l * nkv + i);
+		wr32(m->kscale + (row * m->ctx + m->pos) * 4, ks[i]);
+		wr32(m->vscale + (row * m->ctx + m->pos) * 4, vs[i]);
+		int16_t ve = (int16_t)(vs[i] >> 16);
+		if (row < VEM_ROWS && (m->pos == 0 || ve > VEM[row])) VEM[row] = ve;
+	}
+	ks_row = ~0u;                       /* the copies in attend() are stale now */
 }
 
-/* attention for q head h (in S at qh, exponent eq) -> o into qh */
-static void attend(mlm_ctx_t *m, int l, int h, int32_t *qh)
+/* attention for every q head of layer l (q in S, head h at q + h hd,
+ * exponents eqh) -> o into the same place, exponents eoh. Per head: the
+ * scores (K . q, an 8-bit run), their softmax with the V scales folded
+ * in (the vector unit), then V^T . coef (an 8-bit run) and the 1/sum.
+ * The engine and the CPU overlap across heads: K of head h + 1 runs
+ * during head h's softmax, V of head h during head h + 1's scores. Head
+ * h's two runs go into bank h & 1, so each bank is read before the
+ * next run into it starts. The results are the same as head by head. */
+static void att_load(mlm_ctx_t *m, uint32_t row, uint32_t T)
+{
+	if (row == ks_row && T == ks_n) return;   /* the GQA group's other head */
+	int ps_ = plat_prof_cur(); plat_prof(MLM_PROF_READ);
+	/* the engine is idle here: the DMA unit copies them */
+	int vemax = -32768;
+	plat_mem_rd(KS, m->kscale + row * m->ctx * 4, T);
+	plat_mem_rd(VS, m->vscale + row * m->ctx * 4, T);
+	if (row < VEM_ROWS) vemax = VEM[row];
+	else for (uint32_t t = 0; t < T; t++) {
+		int ve = (int16_t)(VS[t] >> 16);
+		if (ve > vemax) vemax = ve;
+	}
+	ks_row = row; ks_n = T; vs_emax = vemax;
+	plat_prof(ps_);
+}
+static void attend_all(mlm_ctx_t *m, int l, int32_t *q)
 {
 	const mlm_header_t *hd = m->hdr;
-	int n = hd->head_dim, hp = m->hd_pad;
-	int kh = h / (hd->n_heads / hd->n_kv_heads);
-	uint32_t row = (uint32_t)(l * hd->n_kv_heads + kh);
-	uint32_t T = m->pos + 1;
+	int n = hd->head_dim, hp = m->hd_pad, nh = hd->n_heads, g = nh / hd->n_kv_heads;
+	uint32_t T = m->pos + 1, Tp = (T + 31) & ~31u;
+	int exq[MLM_MAX_HEADS];
+	uint64_t sum = 0;
+	int ec = 0;
+	#define ROW(h) ((uint32_t)(l * hd->n_kv_heads + (h) / g))
+	/* q scaled by 1/sqrt(head_dim) (and its deferred norm factor) */
+	#define PREP(h) do { int32_t as_ = (int32_t)hd->attn_scale; \
+		if (qf[h]) as_ = (int32_t)(((int64_t)as_ * qf[h] + (1 << 14)) >> 15); \
+		v_mulshr30(q + (h) * n, q + (h) * n, n, as_); } while (0)
+	/* K . q into the head's bank (the engine must be idle: X) */
+	#define START_K(h) do { exq[h] = to_x(q + (h) * n, n, eqh[h], hp); \
+		plat_eng_start(m->kcache + ROW(h) * m->ctx * m->k_stride, m->k_stride, T, (uint32_t)hp / 32, 8, (h) & 1); \
+		if (!mlm_overlap) plat_eng_wait(); \
+		m->n_dot++; m->dot_rows += T; } while (0)
+	/* the scores out of the head's bank into ATT */
+	#define SCORES(h) do { plat_eng_rbank((h) & 1); \
+		int s1_ = bitlen64(plat_eng_maxabs()) - 31; if (s1_ < 0) s1_ = 0; \
+		plat_eng_out32_block(ATT, 0, T, s1_); exq[h] += s1_; } while (0)
 
-	/* scores: q scaled by 1/sqrt(head_dim) first */
-	int32_t as = (int32_t)hd->attn_scale;
-	if (qf[h]) as = (int32_t)(((int64_t)as * qf[h] + (1 << 14)) >> 15);   /* q's deferred norm factor */
-	v_mulshr30(qh, qh, n, as);
-	int exq = to_x(qh, n, eqh[h], hp);
-	dot_raw(m, m->kcache + row * m->ctx * m->k_stride, m->k_stride, T, hp / 32);
-	if (row != ks_row || T != ks_n) {
-		int ps_ = plat_prof_cur(); plat_prof(MLM_PROF_READ);
-		/* one array, then the other: sequential reads are answered
-		 * from the SOC's copy of the last line (rtl/mlm_soc.v) */
-		const volatile uint32_t *ksc = (const volatile uint32_t *)MEM(m->kscale + row * m->ctx * 4);
-		const volatile uint32_t *vsc = (const volatile uint32_t *)MEM(m->vscale + row * m->ctx * 4);
-		int vemax = -32768;
-		cp_words(KS, ksc, T);
-		cp_words(VS, vsc, T);
-		for (uint32_t t = 0; t < T; t++) {
-			int ve = (int16_t)(VS[t] >> 16);
-			if (ve > vemax) vemax = ve;
+	PREP(0);
+	START_K(0);
+	plat_eng_wait();
+	att_load(m, ROW(0), T);
+	SCORES(0);
+	if (nh > 1) PREP(1);
+	for (int h = 0; h < nh; h++) {
+		if (h + 1 < nh) START_K(h + 1);
+		/* head h's softmax weights, the V scales folded in (one pass) */
+		int32_t smax = v_attsc(ATT, KS, (int)T, exq[h] + 16);
+		uint32_t cmax = v_expcoef(ATT, VS, (int)T, smax, vs_emax, &sum);
+		/* the coefficients are unsigned (up to 2^32): halved first if
+		 * they would not fit the packer's int32 */
+		int ce = vs_emax;
+		if (cmax >> 31) {
+			for (uint32_t t = 0; t < T; t++) ATT[t] = (int32_t)((uint32_t)ATT[t] >> 1);
+			ce++;
 		}
-		ks_row = row; ks_n = T; vs_emax = vemax;
-		plat_prof(ps_);
+		if (h + 1 < nh) {
+			plat_eng_wait();
+			/* head h + 1's scales (after head h's softmax, before its scores) */
+			if (ROW(h + 1) != ROW(h)) att_load(m, ROW(h + 1), T);
+		}
+		/* o = (V^T . coef) / sum, into the head's bank */
+		ec = to_x(ATT, (int)T, ce, (int)Tp);
+		plat_eng_start(m->vcache + ROW(h) * n * m->v_stride, m->v_stride, (uint32_t)n, Tp / 32, 8, h & 1);
+		if (!mlm_overlap) plat_eng_wait();
+		m->n_dot++; m->dot_rows += (uint32_t)n;
+		int rs = bitlen64(sum);
+		int32_t r15 = recip15(sum, rs);      /* 2^(29+rs) / sum, to 15 bits */
+		if (h + 1 < nh) {
+			SCORES(h + 1);
+			if (h + 2 < nh) PREP(h + 2);
+		}
+		plat_eng_wait();
+		/* read to 30 bits, then (o >> 15) r15 in the vector unit */
+		plat_eng_rbank(h & 1);
+		int s2 = bitlen64(plat_eng_maxabs()) - 30;
+		if (s2 < 0) s2 = 0;
+		plat_eng_out32_block(q + h * n, 0, (uint32_t)n, s2);
+		v_scale15(q + h * n, q + h * n, n, r15);
+		eoh[h] = ec - 29 - rs + s2 + 30;
 	}
-	int s1 = bitlen64(plat_eng_maxabs()) - 31;
-	if (s1 < 0) s1 = 0;
-	plat_eng_out32_block(ATT, 0, T, s1);
-	int32_t smax = v_attsc(ATT, KS, (int)T, exq + s1 + 16);
-
-	/* softmax weights, and the V scales folded in */
-	uint64_t sum = v_expsum(ATT, (int)T, smax);
-	uint32_t cmax = v_coef(ATT, VS, (int)T, vs_emax);
-	/* the coefficients are unsigned (up to 2^32): halved first if
-	 * they would not fit the packer's int32 */
-	uint32_t Tp = (T + 31) & ~31u;
-	int ce = vs_emax;
-	if (cmax >> 31) {
-		for (uint32_t t = 0; t < T; t++) ATT[t] = (int32_t)((uint32_t)ATT[t] >> 1);
-		ce++;
-	}
-	int ec = to_x(ATT, (int)T, ce, (int)Tp);
-
-	/* o = (V^T . coef) / sum */
-	dot_raw(m, m->vcache + row * n * m->v_stride, m->v_stride, n, Tp / 32);
-	int rs = bitlen64(sum);
-	int32_t r15 = recip15(sum, rs);      /* 2^(29+rs) / sum, to 15 bits */
-	/* read to 30 bits, then (o >> 15) r15 in the vector unit */
-	int s2 = bitlen64(plat_eng_maxabs()) - 30;
-	if (s2 < 0) s2 = 0;
-	plat_eng_out32_block(qh, 0, (uint32_t)n, s2);
-	v_scale15(qh, qh, n, r15);
-	eoh[h] = ec - 29 - rs + s2 + 30;
+	plat_eng_rbank(0);
+	#undef ROW
+	#undef PREP
+	#undef START_K
+	#undef SCORES
 }
 
 /* h (eh) += v (ev); returns the new exponent. The sum is renormalised
@@ -694,9 +647,11 @@ static int residual(int32_t *h, int eh, const int32_t *v, int ev, int n)
 	uint32_t mx = v_resid(h, v, n, e - eh, e - ev);
 	int sh = 30 - bitlen64(mx);
 	if (mx && sh > 0) {
-		v_rshr(h, h, n, -sh);
+		v_rshr(h, h, n, -sh);       /* a left shift: exact, so the max shifts with it */
 		e -= sh;
+		mx <<= sh;
 	}
+	if (h == H) { h_max = mx; h_max_ok = 1; }
 	return e;
 }
 
@@ -781,20 +736,18 @@ int mlm_step_ex(mlm_ctx_t *m, uint32_t token, int logits)
 	if (m->pos >= m->ctx) return -1;
 
 	int eh = embed(m, token, H);
+	h_max_ok = 0;
 #ifdef MLM_DUMP
 	mlm_dump("emb", H, dim, eh);
 #endif
-	{
-		const volatile uint32_t *src = (const volatile uint32_t *)MEM(hd->rope_off + m->pos * (hdim / 2) * 4);
-		cp_words((uint32_t *)RT, src, (uint32_t)hdim / 2);
-	}
-	const mlm_layer_t *layers = (const mlm_layer_t *)MEM(hd->layers_off);
+	plat_mem_rd(RT, hd->rope_off + m->pos * (hdim / 2) * 4, (uint32_t)hdim / 2);
 	int32_t *q = S, *k = S + qd, *v = S + qd + kvd;
 
 	for (uint32_t l = 0; l < hd->n_layers; l++) {
 		/* the descriptor in block RAM: main memory is the engine's
 		 * while it streams */
-		mlm_layer_t Lc = layers[l];
+		mlm_layer_t Lc;
+		plat_mem_rd(&Lc, hd->layers_off + l * (uint32_t)sizeof(mlm_layer_t), (uint32_t)(sizeof(mlm_layer_t) / 4));
 		const mlm_layer_t *L = &Lc;
 		plat_prof(MLM_PROF_NORM);
 		int en = rmsnorm(m, S, H, dim, eh, &L->attn_norm, 0);
@@ -843,11 +796,9 @@ int mlm_step_ex(mlm_ctx_t *m, uint32_t token, int logits)
 		if (l == 0) mlm_dump("v", v, kvd, ev);
 #endif
 		plat_prof(MLM_PROF_KV);
-		for (int i = 0; i < nkv; i++)
-			kv_store(m, l, i, k + i * hdim, ekh[i], kf[i], v + i * hdim, ev);
+		kv_store_all(m, (int)l, k, ekh, kf, v, ev);
 		plat_prof(MLM_PROF_ATT);
-		for (int i = 0; i < nh; i++)
-			attend(m, l, i, q + i * hdim);
+		attend_all(m, (int)l, q);
 		plat_prof(MLM_PROF_WO);
 		int eo = -10000;
 		for (int i = 0; i < nh; i++) if (eoh[i] > eo) eo = eoh[i];
@@ -880,11 +831,11 @@ int mlm_step_ex(mlm_ctx_t *m, uint32_t token, int logits)
 			plat_prof(MLM_PROF_NORM);
 			if (pc == 0) ex = to_x(S, dim, en, PAD128(dim));
 			else {
-				/* the same input again: still packed in XQ/XDW (the
-				 * GLU unit wrote X, nothing wrote those) */
+				/* the same input again (the GLU unit wrote X): S[0..dim)
+				 * still holds it, and packs to the same values */
 				int ps = plat_prof_cur();
 				plat_prof(MLM_PROF_PACK);
-				plat_eng_xload(XQ, PAD128(dim) / 4, XDW, PAD128(dim) / 32);
+				plat_eng_xpack(S, dim, PAD128(dim));
 				plat_prof(ps);
 			}
 			plat_prof(MLM_PROF_FFN1);

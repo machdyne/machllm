@@ -27,6 +27,11 @@ uint64_t plat_eng_maxabs(void) { return 0; }
 int32_t plat_eng_out32(uint32_t, int) { return 0; }
 void plat_eng_out32_block(int32_t *d, uint32_t, uint32_t n, int) { for (uint32_t k = 0; k < n; k++) d[k] = 0; }
 void plat_eng_xload(const uint32_t *, int, const uint32_t *, int) {}
+int plat_eng_xpack(const int32_t *, int, int) { return 0; }
+void plat_mem_rd(void *, uint32_t, uint32_t) {}
+void plat_mem_wblk(uint32_t, const void *, uint32_t) {}
+void plat_mem_wcol(uint32_t, const void *, uint32_t, uint32_t) {}
+void plat_dma_wait(void) {}
 void plat_putc(int) {}
 }
 
@@ -69,9 +74,10 @@ int main(int argc, char **argv)
 	if (bus(0, 0xa, 0) != 0x56553031u) { fprintf(stderr, "no ID\n"); return 1; }
 	const uint32_t A = 1000, B = 9000, D = 17000;    // word addresses
 	int fails = 0, runs = 0;
-	uint64_t elems = 0, cyc = 0;
+	uint64_t elems = 0, cyc = 0, op_e[16] = {0}, op_c[16] = {0};
 	for (int t = 0; t < 3000; t++) {
-		int op = 1 + t % 14;
+		static const int live[] = { 1, 2, 3, 4, 5, 6, 8, 9, 10, 15 };
+		int op = live[t % 10];
 		int n = (int)(rnd() % 300);
 		if (t % 50 == 0) n = 0;
 		if (t % 37 == 0) n = 1;
@@ -83,14 +89,9 @@ int main(int argc, char **argv)
 		case MLM_VU_RSHR: p0 = (int)(rnd() % 50) - 25; if (p0 < 0) bits = 31 + p0 > 1 ? 31 + p0 : 1; break;
 		case MLM_VU_RESID: p0 = 1 + rnd() % 33; p1 = 1 + rnd() % 33; break;
 		case MLM_VU_MULSHR30: p0 = rval(31); break;
-		case MLM_VU_QPACK: p0 = (int)(rnd() % 34) - 1; p1 = 2 * (int)(rnd() % 200); if (rnd() & 1) p1 = (n + 1) & ~1; break;
 		case MLM_VU_KVQ8: n &= ~3; p0 = rnd() % 20; p1 = (int32_t)(rnd() % (127u << 16)); break;
 		case MLM_VU_ROPE: n = 2 * (8 + rnd() % 64); p0 = rnd() & 1; bits = 31; break;
 		case MLM_VU_ATTSC: p0 = (int)(rnd() % 81) - 40; break;
-		case MLM_VU_EXPSUM: bits = 31; break;
-		case MLM_VU_COEF: break;
-		case MLM_VU_QPACKU: p0 = (int)(rnd() % 36) - 15; p1 = 2 * (int)(rnd() % 200); if (rnd() & 1) p1 = (n + 1) & ~1; break;
-		case MLM_VU_MXPACK: p1 = (n + 31) & ~31; if (rnd() & 1) p1 += 32 * (int)(rnd() % 3); break;
 		default: break;
 		}
 		for (int i = 0; i < 300 + 8; i++) {
@@ -101,41 +102,37 @@ int main(int argc, char **argv)
 		// the attention operations' inputs, in the ranges the model gives them
 		if (op == MLM_VU_ATTSC)
 			for (int i = 0; i < 308; i++) ram[B + i] = (rnd() & 0xffff) | ((uint32_t)(uint16_t)((int)(rnd() % 71) - 50) << 16);
-		if (op == MLM_VU_EXPSUM) {
-			int32_t mxv = -0x7fffffff;
-			/* scores in Q16 within ~20 of the largest, as a softmax sees them */
-			int32_t top = rval(31) >> 2;
-			for (int i = 0; i < 308; i++) ram[A + i] = (uint32_t)(top - (int32_t)(rnd() % (20u << 16)));
-			for (int i = 0; i < n; i++) if ((int32_t)ram[A + i] > mxv) mxv = (int32_t)ram[A + i];
-			p0 = mxv;
-		}
-		if (op == MLM_VU_COEF) {
+		if (op == MLM_VU_EXPCOEF) {
+			/* EXPSUM's scores, COEF's scale words */
+			int32_t mxv = -0x7fffffff, top = rval(31) >> 2;
 			int emax = -32768;
 			for (int i = 0; i < 308; i++) {
-				ram[A + i] = rnd() % 65537;
+				ram[A + i] = (uint32_t)(top - (int32_t)(rnd() % (20u << 16)));
 				int e = (rnd() & 7) ? (int)(rnd() % 41) - 30 : (int)(rnd() % 141) - 130;
 				ram[B + i] = (rnd() & 0xffff) | ((uint32_t)(uint16_t)e << 16);
+				if (i < n && (int32_t)ram[A + i] > mxv) mxv = (int32_t)ram[A + i];
 				if (i < n && e > emax) emax = e;
 			}
-			p0 = n ? emax : 0;
+			p0 = mxv; p1 = n ? emax : 0;
 		}
 		std::vector<uint32_t> want = ram;
 		uint64_t ws = 0;
 		uint32_t wr = mlm_vu_ref(op, &want[A], &want[B],
 		                         (op == MLM_VU_RESID || op == MLM_VU_ROPE || op == MLM_VU_ATTSC ||
-		                          op == MLM_VU_EXPSUM || op == MLM_VU_COEF) ? &want[A] : &want[D],
+		                          op == MLM_VU_EXPCOEF) ? &want[A] : &want[D],
 		                         (uint32_t)n, p0, p1, &ws);
 		bus(1, 0, A * 4); bus(1, 1, B * 4); bus(1, 2, D * 4); bus(1, 3, (uint32_t)n);
 		bus(1, 4, (uint32_t)p0); bus(1, 5, (uint32_t)p1);
 		uint64_t c0 = cycles;
 		bus(1, 6, (uint32_t)op);
 		cyc += cycles - c0; elems += (uint32_t)n;
+		op_c[op] += cycles - c0; op_e[op] += (uint32_t)n;
 		uint32_t gr = bus(0, 7, 0);
 		uint64_t gs = bus(0, 8, 0) | ((uint64_t)bus(0, 9, 0) << 32);
 		bool ok = ram == want;
-		if ((op == MLM_VU_MAXABS || op == MLM_VU_RESID || op == MLM_VU_ATTSC || op == MLM_VU_COEF ||
-		     op == MLM_VU_MXPACK) && gr != wr) ok = false;
-		if ((op == MLM_VU_SQMUL || op == MLM_VU_EXPSUM) && gs != ws) ok = false;
+		if ((op == MLM_VU_MAXABS || op == MLM_VU_RESID || op == MLM_VU_ATTSC ||
+		     op == MLM_VU_EXPCOEF) && gr != wr) ok = false;
+		if ((op == MLM_VU_SQMUL || op == MLM_VU_EXPCOEF) && gs != ws) ok = false;
 		runs++;
 		if (!ok) {
 			if (fails++ < 10) {
@@ -149,6 +146,7 @@ int main(int argc, char **argv)
 			ram = want;
 		}
 	}
+	for (int o = 1; o < 16; o++) if (op_e[o]) printf("  op %2d: %.1f cycles an element\n", o, (double)op_c[o] / op_e[o]);
 	printf("%s: %d runs, %d wrong; %.1f cycles an element\n", fails ? "FAIL" : "PASS", runs, fails,
 	       elems ? (double)cyc / elems : 0.0);
 	return fails ? 1 : 0;

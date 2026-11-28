@@ -42,18 +42,25 @@ Measured on a Sergei ML2:
 | DDR3 | trained at 180 MT/s; the engine streams 648 MB/s |
 | loading Bonsai from SD | 246 MB in ~21 s (4-bit bus, 24 MHz) |
 | engine self-test, `:e` | the engine's results equal the CPU's |
-| generating (75 MHz build) | coherent answers, **1.24 tokens/s** over a 256-token answer |
-| 90 MHz build | meets timing; on the board a prompt token takes 0.54 s |
+| generating (before the data-path work below) | coherent answers, **1.24 tokens/s** over a 256-token answer (0.83 s a token at position ~290, 45% of it with the engine idle) |
 
 The firmware and the PC reference compute the same integer arithmetic,
 and every simulation (`docs/testing.md`) is bit-exact against it.
+
+The current design moves the bulk data on the memory clock (the RAM's
+second port: the engine's packer and copy-out, a DMA unit), streams the
+vector unit's operations and overlaps attention's heads with the
+engine. In simulation (one Bonsai layer, position 337) that cuts a
+token's CPU cycles by 30% (attention by 57%), the engine's own time
+unchanged; on the board that should come to roughly 1.8 tokens/s, to
+be measured.
 
 Known limits:
 
 - Context of 512 positions per conversation (`:reset` starts over);
   answers stop at the model's end token or after `:n` tokens (256).
-- Attention grows with the context: at position ~280 a token takes
-  ~0.8 s instead of ~0.7 s.
+- Attention grows with the context (it reads the whole KV cache, once
+  per query head).
 - Prompts cost one weight pass per token (no batched prefill yet).
 - The firmware does not yet refuse a model image with 4- or 8-bit
   weights (an old one loads and produces nonsense).

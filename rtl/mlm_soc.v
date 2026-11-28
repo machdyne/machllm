@@ -14,6 +14,11 @@
  *   0x7100_0000  UART
  *   0x7200_0000  SD
  *   0x8000_0000  ENGINE   64 KB window (rtl/mlm_engine.v)
+ *   0x8100_0000  DMA      main memory <-> RAM (rtl/mlm_dma.v)
+ *
+ * The RAM has a second port on the memory clock: the engine's copy-out
+ * writes results into it, its packer reads vectors from it, and the
+ * DMA unit moves blocks between it and main memory.
  *
  * The RAM answers in one cycle and takes a request every cycle; every
  * other target holds the port until it answers.
@@ -129,9 +134,8 @@ module mlm_soc #(
 	wire t_uart  = (m_adr[31:24] == 8'h71);
 	wire t_sd    = (m_adr[31:24] == 8'h72);
 	wire t_eng   = (m_adr[31:28] == 4'h8);
+	wire t_dma   = t_eng && m_adr[24];      // 0x8100_0000: the DMA unit (on the engine's path)
 	wire t_vu    = (m_adr[31:24] == 8'h73);
-	wire t_mir   = (m_adr[31:24] == 8'h74);
-	wire t_xst   = (m_adr[31:24] == 8'h75);
 	wire t_ui    = (m_adr[31:24] == 8'h76) && UI;
 
 	// a slow access in progress: its target, address and data held
@@ -172,35 +176,25 @@ module mlm_soc #(
 			ram_q <= ram[ram_a];
 		end
 	end
-
-	// the engine's result mirror: written by its copy-out on the memory
-	// clock, read here like the RAM (an ack the cycle after); writes from
-	// the CPU are ignored. 0x7400_0000 + 4k: row k of the last copy-out.
-	wire eng_mir_we;
-	wire [10:0] eng_mir_wa;
-	wire [31:0] eng_mir_wd;
-	reg [31:0] mir [0:2047];
-	reg [31:0] mir_q;
-	reg mir_ack;
-	always @(posedge fclk) if (eng_mir_we) mir[eng_mir_wa] <= eng_mir_wd;
-	always @(posedge clk) begin
-		mir_ack <= take && t_mir && !rst;
-		if (take && t_mir) mir_q <= mir[m_adr[12:2]];
+	// the second port, on the memory clock: the engine's (copy-out
+	// writes, packer reads) while it uses it, else the DMA unit's
+	wire e_pb_we, e_pb_busy, d_pb_we;
+	wire [AW-1:0] e_pb_wa, e_pb_ra, d_pb_a;
+	wire [31:0] e_pb_wd, d_pb_wd;
+	reg [31:0] pb_q0, pb_q;           // the read, then registered again (the 24-way
+	                                  // mux over the block RAMs is most of a cycle)
+	// (the choice registered: the engine's busy flag rises at least two
+	// cycles before its first access, and the two never overlap)
+	reg e_pb_own;
+	always @(posedge fclk) e_pb_own <= e_pb_busy && !frst;
+	wire [AW-1:0] pb_a = e_pb_we ? e_pb_wa : e_pb_own ? e_pb_ra : d_pb_a;
+	wire pb_we = e_pb_we || d_pb_we;
+	wire [31:0] pb_wd = e_pb_we ? e_pb_wd : d_pb_wd;
+	always @(posedge fclk) begin
+		if (pb_we) ram[pb_a] <= pb_wd;
+		pb_q0 <= ram[pb_a];
+		pb_q <= pb_q0;
 	end
-
-	// the engine's input staging: written here like the RAM (an ack the
-	// cycle after; reads return 0), read by the engine's copy-in on the
-	// memory clock. 0x7500_0000 + 4w: words 0..767 the int8 values,
-	// 768.. the block offsets.
-	wire [9:0] eng_xs_ra;
-	reg [31:0] eng_xs_q;
-	reg [31:0] xst [0:1023];
-	reg xst_ack;
-	always @(posedge clk) begin
-		xst_ack <= take && t_xst && !rst;
-		if (take && t_xst && m_we) xst[m_adr[11:2]] <= m_wdat;
-	end
-	always @(posedge fclk) eng_xs_q <= xst[eng_xs_ra];
 
 	// the vector unit (rtl/mlm_vu.v)
 	wire vu_ack, rq_vu;
@@ -229,10 +223,11 @@ module mlm_soc #(
 	always @(posedge clk) begin
 		ln_ack <= take && ln_hit && !rst;
 		if (take && ln_hit) ln_q <= ln_d[{m_adr[3:2], 5'd0} +: 32];
-		if (rst || s_wq_valid) ln_quiet <= 5'd31;
+		if (rst || s_wq_valid || (take && t_dma && m_we)) ln_quiet <= 5'd31;
 		else if (ln_quiet != 5'd0) ln_quiet <= ln_quiet - 5'd1;
 		if (rst || !ln_en) ln_v <= 1'b0;
-		else if ((take && (t_main || t_dreg) && !ln_hit && (m_we || t_dreg)) || s_wq_valid || ln_quiet != 5'd0) ln_v <= 1'b0;
+		else if ((take && (t_main || t_dreg) && !ln_hit && (m_we || t_dreg)) || s_wq_valid || ln_quiet != 5'd0 ||
+		         (take && t_dma && m_we)) ln_v <= 1'b0;   // the DMA unit may write main memory
 		else if (pend && pt == 3'd1 && !p_we && b_ack) begin
 			ln_v <= b_line_v;
 			ln_tag <= p_adr[28:4];
@@ -261,7 +256,7 @@ module mlm_soc #(
 		if (rst) begin
 			pend <= 1'b0;
 			pt <= 3'd0;
-		end else if (take && !t_ram && !t_mir && !t_xst && !t_ui && !ln_hit) begin
+		end else if (take && !t_ram && !t_ui && !ln_hit) begin
 			pend <= 1'b1;
 			pt <= t_main ? 3'd1 : t_dreg ? 3'd2 : t_uart ? 3'd3 : t_sd ? 3'd4 :
 			      t_eng ? 3'd5 : t_vu ? 3'd7 : 3'd6;
@@ -287,16 +282,21 @@ module mlm_soc #(
 	wire [31:0] q_adr, q_wdat;
 	wire [3:0] q_sel;
 	wire q_we;
-	wire rq_main = q_pend && q_pt == 3'd1;
+	wire rq_main_b = q_pend && q_pt == 3'd1;    // the bridge's
+	wire dma_own;                               // the DMA unit has the word port
+	wire rq_main = rq_main_b && !dma_own;
 	wire rq_dreg = q_pend && q_pt == 3'd2;
 	// the SD host: on the memory side with one clock, on the CPU's side
 	// with two (it is slow; its block writes cross below)
 	wire rq_sd   = TWO_CLK ? (pend && pt == 3'd4 && !sd_ack) : (q_pend && q_pt == 3'd4 && !sd_ack);
-	wire rq_eng  = q_pend && q_pt == 3'd5 && !eng_ack;
-	wire q_ack = (q_pt == 3'd1 && main_ack) || (q_pt == 3'd2 && dreg_ack) ||
-	             (q_pt == 3'd4 && sd_ack && !TWO_CLK) || (q_pt == 3'd5 && eng_ack);
+	wire dma_ack;
+	wire [31:0] dma_rdat;
+	wire rq_eng  = q_pend && q_pt == 3'd5 && !q_adr[24] && !eng_ack;
+	wire rq_dma  = q_pend && q_pt == 3'd5 && q_adr[24] && !dma_ack;
+	wire q_ack = (q_pt == 3'd1 && main_ack && !dma_own) || (q_pt == 3'd2 && dreg_ack) ||
+	             (q_pt == 3'd4 && sd_ack && !TWO_CLK) || (q_pt == 3'd5 && (eng_ack || dma_ack));
 	wire [31:0] q_rdat = (q_pt == 3'd1) ? main_rdat : (q_pt == 3'd2) ? dreg_rdat :
-	                     (q_pt == 3'd4) ? sd_rdat : eng_rdat;
+	                     (q_pt == 3'd4) ? sd_rdat : q_adr[24] ? dma_rdat : eng_rdat;
 	wire b_ack;                     // the mclk side answered (TWO_CLK)
 	wire [31:0] b_rdat;
 	wire [127:0] b_line;            // and the line of a main-memory read
@@ -374,8 +374,8 @@ module mlm_soc #(
 		assign tmds_clk = 2'b00; assign tmds_r = 2'b00; assign tmds_g = 2'b00; assign tmds_b = 2'b00;
 	end endgenerate
 
-	assign m_ack = ram_ack || mir_ack || xst_ack || ln_ack || ui_ack || s_ackd;
-	assign m_rdat = ram_ack ? ram_q : mir_ack ? mir_q : xst_ack ? 32'd0 : ln_ack ? ln_q : ui_ack ? ui_q : s_rdat;
+	assign m_ack = ram_ack || ln_ack || ui_ack || s_ackd;
+	assign m_rdat = ram_ack ? ram_q : ln_ack ? ln_q : ui_ack ? ui_q : s_rdat;
 
 	// ---------------------------------------------------------------
 	// SYSCTL
@@ -402,6 +402,39 @@ module mlm_soc #(
 	wire [8:0] sq_len;
 	wire [127:0] sdd, wq_data;
 
+	// the controller's ports, shared: the word port (the bridge, or the
+	// DMA unit's byte stores while it owns it), the stream (the engine,
+	// or a DMA read: never both at once), block writes (the SD loader
+	// or the DMA unit: whoever has one waiting, kept until it is taken)
+	wire d_sqv, d_rd_act, d_wqv, d_wb_want, d_wb_req;
+	wire [24:0] d_sqblk, d_wqblk;
+	wire [8:0] d_sqlen;
+	wire [127:0] d_wqdata;
+	wire [26:0] d_wb_adr;
+	wire [3:0] d_wb_sel;
+	wire [31:0] d_wb_dat;
+	reg dma_own_r;
+	assign dma_own = dma_own_r;
+	always @(posedge fclk)
+		if (frst) dma_own_r <= 1'b0;
+		else if (!dma_own_r && d_wb_want && !rq_main_b) dma_own_r <= 1'b1;
+		else if (dma_own_r && !d_wb_want) dma_own_r <= 1'b0;
+	wire [26:0] c_adr = dma_own ? d_wb_adr : q_adr[28:2];
+	wire [31:0] c_wdat = dma_own ? d_wb_dat : q_wdat;
+	wire c_we = dma_own ? 1'b1 : q_we;
+	wire [3:0] c_sel = dma_own ? d_wb_sel : q_sel;
+	wire c_stb = dma_own ? d_wb_req : rq_main;
+	wire c_sqv = sq_valid || d_sqv;
+	wire [24:0] c_sqblk = d_sqv ? d_sqblk : sq_blk;
+	wire [8:0] c_sqlen = d_sqv ? d_sqlen : sq_len;
+	reg wq_dma;                     // the block-write port's owner
+	always @(posedge fclk)
+		if (frst) wq_dma <= 1'b0;
+		else if (!(wq_dma ? d_wqv : wq_valid)) wq_dma <= !wq_valid && d_wqv;
+	wire c_wqv = wq_dma ? d_wqv : wq_valid;
+	wire [24:0] c_wqblk = wq_dma ? d_wqblk : wq_blk;
+	wire [127:0] c_wqdata = wq_dma ? d_wqdata : wq_data;
+
 	generate if (SIM_DDR3) begin : sim_ddr3
 		// the controller against the checking DRAM model; the
 		// registers answer as a trained PHY would (STATUS init done)
@@ -411,12 +444,12 @@ module mlm_soc #(
 		wire [127:0] wdata, rdata;
 		mlm_ddr3_ctrl #(.ROW_BITS(15), .TRFC_NS(260), .INIT_DIV(100), .CLK_MHZ(MEM_MHZ)) ctrl (
 			.clk_i(fclk), .rst_i(frst),
-			.wb_adr_i(q_adr[28:2]), .wb_dat_i(q_wdat), .wb_dat_o(main_rdat), .wb_we_i(q_we),
-			.wb_sel_i(q_sel), .wb_stb_i(rq_main), .wb_cyc_i(rq_main), .wb_ack_o(main_ack),
+			.wb_adr_i(c_adr), .wb_dat_i(c_wdat), .wb_dat_o(main_rdat), .wb_we_i(c_we),
+			.wb_sel_i(c_sel), .wb_stb_i(c_stb), .wb_cyc_i(c_stb), .wb_ack_o(main_ack),
 			.wb_line_o(main_line), .wb_line_v_o(main_line_v),
-			.sq_valid_i(sq_valid), .sq_ready_o(sq_ready), .sq_blk_i(sq_blk), .sq_len_i(sq_len),
+			.sq_valid_i(c_sqv), .sq_ready_o(sq_ready), .sq_blk_i(c_sqblk), .sq_len_i(c_sqlen),
 			.sd_valid_o(sdv), .sd_data_o(sdd),
-			.wq_valid_i(wq_valid), .wq_ready_o(wq_ready), .wq_blk_i(wq_blk), .wq_data_i(wq_data),
+			.wq_valid_i(c_wqv), .wq_ready_o(wq_ready), .wq_blk_i(c_wqblk), .wq_data_i(c_wqdata),
 			.phy_ready_i(1'b1), .init_done_o(init_done), .rd_timeout_o(),
 			.no_refresh_i(1'b0), .wr_noread_i(1'b0), .rdbuf_off_i(1'b0), .st_gap_i(2'd0),
 			.phy_reset_n_o(), .phy_cke_o(), .phy_odt_o(),
@@ -443,12 +476,12 @@ module mlm_soc #(
 			.clk_i(fclk), .rst_i(frst),
 			.eclk_i(eclk), .ddrdel_i(ddrdel), .pause_i(pause), .phy_rst_i(phy_rst),
 			.phy_ready_i(phy_ready), .pll_locked_i(pll_locked),
-			.wb_adr_i(q_adr[28:2]), .wb_dat_i(q_wdat), .wb_dat_o(main_rdat),
-			.wb_we_i(q_we), .wb_sel_i(q_sel), .wb_stb_i(rq_main), .wb_cyc_i(rq_main),
+			.wb_adr_i(c_adr), .wb_dat_i(c_wdat), .wb_dat_o(main_rdat),
+			.wb_we_i(c_we), .wb_sel_i(c_sel), .wb_stb_i(c_stb), .wb_cyc_i(c_stb),
 			.wb_ack_o(main_ack), .wb_line_o(main_line), .wb_line_v_o(main_line_v),
-			.sq_valid_i(sq_valid), .sq_ready_o(sq_ready), .sq_blk_i(sq_blk), .sq_len_i(sq_len),
+			.sq_valid_i(c_sqv), .sq_ready_o(sq_ready), .sq_blk_i(c_sqblk), .sq_len_i(c_sqlen),
 			.sd_valid_o(sdv), .sd_data_o(sdd),
-			.wq_valid_i(wq_valid), .wq_ready_o(wq_ready), .wq_blk_i(wq_blk), .wq_data_i(wq_data),
+			.wq_valid_i(c_wqv), .wq_ready_o(wq_ready), .wq_blk_i(c_wqblk), .wq_data_i(c_wqdata),
 			.reg_adr_i(q_adr[3:2]), .reg_dat_i(q_wdat), .reg_dat_o(dreg_rdat),
 			.reg_we_i(q_we), .reg_stb_i(rq_dreg), .reg_cyc_i(rq_dreg), .reg_ack_o(dreg_ack),
 			.ddr3_a(ddr3_a), .ddr3_ba(ddr3_ba), .ddr3_ras_n(ddr3_ras_n), .ddr3_cas_n(ddr3_cas_n),
@@ -466,11 +499,39 @@ module mlm_soc #(
 		.clk(fclk), .rst(frst),
 		.bus_req_i(rq_eng), .bus_we_i(q_we), .bus_adr_i(q_adr[16:2]), .bus_wdat_i(q_wdat),
 		.bus_sel_i(q_sel), .bus_ack(eng_ack), .bus_rdat(eng_rdat),
-		.sq_valid(sq_valid), .sq_ready(sq_ready), .sq_blk(sq_blk), .sq_len(sq_len),
-		.sd_valid(sdv), .sd_data(sdd), .busy_o(),
-		.mir_we(eng_mir_we), .mir_wa(eng_mir_wa), .mir_wd(eng_mir_wd),
-		.xs_ra(eng_xs_ra), .xs_q(eng_xs_q)
+		.sq_valid(sq_valid), .sq_ready(sq_ready && !d_sqv), .sq_blk(sq_blk), .sq_len(sq_len),
+		.sd_valid(sdv && !d_rd_act), .sd_data(sdd), .busy_o(eng_busy),
+		.pb_we(e_pb_we), .pb_wa(e_pb_wa), .pb_wd(e_pb_wd), .pb_ra(e_pb_ra), .pb_q(pb_q),
+		.pb_busy(e_pb_busy)
 	);
+	wire eng_busy;
+
+	mlm_dma #(.RAM_AW(AW)) dma (
+		.clk(fclk), .rst(frst),
+		.bus_req(rq_dma), .bus_we(q_we), .bus_adr(q_adr[4:2]), .bus_wdat(q_wdat),
+		.bus_ack(dma_ack), .bus_rdat(dma_rdat),
+		.pb_we(d_pb_we), .pb_a(d_pb_a), .pb_wd(d_pb_wd), .pb_q(pb_q),
+		.sq_valid(d_sqv), .sq_ready(sq_ready && d_sqv), .sq_blk(d_sqblk), .sq_len(d_sqlen),
+		.sd_valid(sdv && d_rd_act), .sd_data(sdd), .rd_act(d_rd_act),
+		.wq_valid(d_wqv), .wq_ready(wq_ready && wq_dma), .wq_blk(d_wqblk), .wq_data(d_wqdata),
+		.wb_want(d_wb_want), .wb_own(dma_own), .wb_req(d_wb_req), .wb_adr(d_wb_adr),
+		.wb_sel(d_wb_sel), .wb_dat(d_wb_dat), .wb_ack(main_ack && dma_own),
+		.busy()
+	);
+`ifndef SYNTHESIS
+	// the firmware's promises: the second RAM port and the stream are
+	// never wanted by the engine and the DMA unit at once
+	always @(posedge fclk) if (!frst) begin
+		if (e_pb_busy && dma.op != 2'd0) begin
+			$display("mlm_soc: the engine and the DMA unit both use the RAM's second port");
+			$stop;
+		end
+		if ((d_sqv || d_rd_act) && (sq_valid || eng_busy)) begin
+			$display("mlm_soc: a DMA read while the engine streams");
+			$stop;
+		end
+	end
+`endif
 
 	// SD block writes into DDR3: straight through with one clock; with
 	// two, a toggle each way per 16-byte block (the SD host holds the
@@ -502,7 +563,7 @@ module mlm_soc #(
 					a_v <= 1'b1;
 					a_blk <= s_wq_blk;
 					a_data <= s_wq_data;
-				end else if (a_v && wq_ready) begin
+				end else if (a_v && wq_ready && !wq_dma) begin
 					a_v <= 1'b0;
 					a_tgl <= ~a_tgl;
 				end
@@ -514,7 +575,7 @@ module mlm_soc #(
 		assign wq_valid = s_wq_valid;
 		assign wq_blk = s_wq_blk;
 		assign wq_data = s_wq_data;
-		assign s_wq_ready = wq_ready;
+		assign s_wq_ready = wq_ready && !wq_dma;
 	end endgenerate
 
 	mlm_sd sd (

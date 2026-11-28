@@ -59,11 +59,21 @@
 #define ENG_GLU_P   REG(0x8000403c)
 #define ENG_GLU_GO  REG(0x80004040)
 #define ENG_GLU_RES REG(0x80004044)
-#define ENG_CO_GO   REG(0x80004048)   /* copy-out: n rows into the mirror */
+#define ENG_CO_GO   REG(0x80004048)   /* copy-out: n rows into the RAM from word CO_DST */
 #define ENG_CO_ROW  REG(0x8000404c)   /* bank << 12 | first row */
-#define ENG_MIRROR  0x74000000u       /* the copy-out's results, read like RAM */
-#define ENG_CI_GO   REG(0x80004050)   /* copy-in: nv | nb << 16 from the staging RAM */
-#define ENG_XSTAGE  0x75000000u       /* the copy-in's source, written like RAM */
+#define ENG_PK_GO   REG(0x80004050)   /* the packer: n | blocks << 16 from the RAM at word PK_SRC */
+#define ENG_CO_DST  REG(0x80004054)
+#define ENG_PK_SRC  REG(0x80004058)
+#define ENG_PK_S    REG(0x80004060)   /* the packing's s */
+
+/* DMA unit (rtl/mlm_dma.v): main memory <-> RAM on the memory clock */
+#define DMA_SRC     REG(0x81000000)
+#define DMA_DST     REG(0x81000004)
+#define DMA_N       REG(0x81000008)
+#define DMA_STRIDE  REG(0x8100000c)
+#define DMA_OUTER   REG(0x81000010)
+#define DMA_OSTRIDE REG(0x81000014)
+#define DMA_GO      REG(0x81000018)   /* write: 1 RD, 2 WBLK, 3 COL; read: busy */
 
 /* vector unit (rtl/mlm_vu.v) */
 #define VU_A        REG(0x73000000)

@@ -197,3 +197,23 @@ int main(int argc, char **argv)
 		        m.pos, dt, m.n_dot, (unsigned long long)m.dot_rows);
 	return 0;
 }
+
+/* the packer and the DMA unit's calls, in C */
+int plat_eng_xpack(const int32_t *v, int n, int padn)
+{
+	static int8_t q[ENG_X_MAX];
+	static uint8_t xd[ENG_X_MAX / 32];
+	static uint32_t qw[ENG_X_MAX / 4], dw[ENG_X_MAX / 32];
+	int sx = eng_mx_pack(v, n, padn, q, xd);
+	memcpy(qw, q, (size_t)padn);
+	for (int b = 0; b < padn / 32; b++) dw[b] = xd[b];
+	plat_eng_xload(qw, padn / 4, dw, padn / 32);
+	return sx;
+}
+void plat_mem_rd(void *dst, uint32_t off, uint32_t nw) { memcpy(dst, plat_mem() + off, 4 * (size_t)nw); }
+void plat_mem_wblk(uint32_t off, const void *src, uint32_t nblk) { memcpy(plat_mem() + off, src, 16 * (size_t)nblk); }
+void plat_mem_wcol(uint32_t off, const void *src, uint32_t n, uint32_t stride)
+{
+	for (uint32_t k = 0; k < n; k++) plat_mem()[off + k * stride] = ((const uint8_t *)src)[k];
+}
+void plat_dma_wait(void) {}

@@ -43,6 +43,41 @@ Timings follow `CLK_MHZ` (tRCD, tRP and tRC from hundredths of a
 nanosecond). Initialisation, mode registers, read-modify-write for CPU
 stores and the training hooks are Zeitlos's. Write combining stays off.
 
+## The DMA unit
+
+`rtl/mlm_dma.v` moves data between main memory and the CPU's RAM on the
+memory clock, through the RAM's second port, so the CPU does not copy
+word by word across the clock crossing (~12 CPU cycles a word). The
+firmware's `plat_mem_rd`, `plat_mem_wblk`, `plat_mem_wcol` and
+`plat_dma_wait` (`fw/main.c`) drive it.
+
+| Offset (0x8100_0000) | Register | |
+|---|---|---|
+| 0x00 | SRC | RD: main-memory offset (16-byte aligned); WBLK, COL: RAM byte address |
+| 0x04 | DST | RD: RAM byte address; WBLK, COL: main-memory offset |
+| 0x08 | N | RD: words; WBLK: blocks a row; COL: bytes a column |
+| 0x0c | STRIDE | COL: bytes between a column's bytes |
+| 0x10 | OUTER | WBLK, COL: rows / columns |
+| 0x14 | OSTRIDE | WBLK, COL: bytes between rows / columns |
+| 0x18 | GO | write 1 RD, 2 WBLK, 3 COL; read bit 0: busy |
+
+- **RD** uses the stream port (at most 16 blocks outstanding, a word a
+  cycle into the RAM), so only while the engine is not running; the
+  firmware falls back to a CPU copy otherwise. The cache scales, norm
+  weights, RoPE rows and layer descriptors come this way.
+- **WBLK** writes 16-byte blocks through the block-write port (shared
+  with the SD loader: whoever has one waiting keeps the port until it
+  is taken). Each position's K row goes this way.
+- **COL** stores single bytes through the controller's word port
+  (read-modify-write there, as for the CPU; masked writes are not used).
+  The transposed V cache gets a byte per dimension per position this
+  way, ~30 memory cycles a byte. While it owns the word port the CPU's
+  main-memory accesses wait.
+
+A write operation returns at once: the firmware quantises the next KV
+head while the DMA unit writes the previous one. The CPU's copy of the
+last line read is dropped whenever a DMA operation starts.
+
 ## Clocks
 
 The DRAM runs far below its rating (DDR3-1866), as Zeitlos and LiteX run

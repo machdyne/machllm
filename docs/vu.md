@@ -37,41 +37,47 @@ loop. The unit must give exactly the same result.
 | 4 RSHR | D[i] = A[i] >> P0 (left for P0 < 0) | residual renormalisation |
 | 5 RESID | A[i] = (A[i] >> P0) + (B[i] >> P1), max | residual add |
 | 6 MULSHR30 | D[i] = (A[i] P0) >> 30, 64-bit product | attention's q scale |
-| 7 QPACK, 13 QPACKU | int16 pairs, clamped, padded (signed, unsigned) | older input format, kept for tests |
 | 8 KVQ8 | int8 for the KV cache, four to a word | KV-cache stores |
 | 9 ROPE | rotate pairs by a table of {sin, cos} | RoPE (both layouts) |
 | 10 ATTSC | raw scores times each position's K scale, max | attention scores |
-| 11 EXPSUM | exp(score − max) from a table, their sum | softmax |
-| 12 COEF | softmax weights times each position's V scale, max | attention × V |
-| 14 MXPACK | int8 blocks of 32 with 4-bit exponent offsets | the engine's input (`to_x`) |
+| 15 EXPCOEF | EXPSUM and COEF in one pass: exp(score − max), their sum, times each V scale, max | softmax, attention × V |
+
+Numbers 7 and 11-14 (QPACK, EXPSUM, COEF, QPACKU, MXPACK) are gone:
+EXPCOEF does EXPSUM and COEF in one pass, the engine's packer does
+MXPACK, and the old int16 input format is no longer used.
 
 `>>` is the model's rounded shift (`rshr32`). Products wrap to 32 bits,
 except MULSHR30's and KVQ8's, as in C.
 
-The unit has one registered multiplier and works on the CPU's RAM
-while the CPU waits. The next element's reads go out during this one's
-arithmetic for the ops that read A[i], B[i] or B[i/2]; SCALE15, RSHR
-and MULSHR30 are **streamed** (state S_FS: a read, then the write of an
-element read seven cycles earlier, every two cycles), SQMUL every three
-(A[j], B[j/2], the write). Per element: MAXABS ~1.2 cycles, the
-streamed four 2-3, MXPACK ~3, RESID ~4, ROPE ~8.5, against 20-30 for
-the CPU's loops (profile: `make -C fw ... CFLAGS_EXTRA=-DVU_PROF`, then
+The unit works on the CPU's RAM while the CPU waits. Most operations
+are **streamed**: reads go out at fixed phases of a short period and
+each result is written a fixed number of cycles after its reads, so
+the RAM's single port is busy every cycle:
+
+| | Period | Per element |
+|---|---|---|
+| SCALE15, RSHR, MULSHR30 (S_FS) | 2 cycles: A[j], a write | 2.1 |
+| SQMUL (S_FS) | 3: A[j], B[j/2], a write | 3.1 |
+| ATTSC, EXPCOEF, RESID (S_AS) | 3: A[j], B[j], the write 14 cycles after A[j] | 3.1 |
+| ROPE (S_P5) | 5 per pair: A[ia], A[ib], the rt word, two writes | 2.6 |
+| KVQ8 (S_P5) | 5 per four: four reads, the word | 1.3 |
+
+MAXABS reads an element a cycle. `sim/vu` prints each operation's
+cycles an element; the CPU's own loops took 20-30 (profile: `make -C fw ... CFLAGS_EXTRA=-DVU_PROF`, then
 `:v`).
 
 ## Testing
 
-- `sim/vu`: the unit with a C++ RAM, 3000 random operations of every
-  kind and size against `mlm_vu_ref()` (the C loops). A planted fault
+- `sim/vu`: the unit with a C++ RAM, 3000 random operations of the ten
+  kinds and of every size against `mlm_vu_ref()` (the C loops). A planted fault
   makes about 1 in 9 of them fail.
 - `sim/soc`, one clock and two: the whole firmware with the unit on
   must still generate exactly what `mlm_run` does.
-- On the board: `vector unit self-test: 140 operations, 0 wrong` after
+- On the board: `vector unit self-test: 150 operations, 0 wrong` after
   each model load (the unit against the C loops on random data, within
   each operation's range). `:u` switches the unit off and on.
 
 ## Next
 
-- ROPE and RESID streamed as the four above.
-- Attention's per-position work grows with the conversation; reading
-  the K and V scales once per KV head, and overlapping heads with the
-  engine, are the next steps.
+- The QK-norms of all heads in fewer calls (each call's set-up and the
+  CPU's square root are most of a head's cost now).

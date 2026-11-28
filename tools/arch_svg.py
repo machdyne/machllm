@@ -50,7 +50,7 @@ t(341,402,"weights",11,DSP,"middle",True); t(341,437,"64 bit",11,DSP,"middle",Tr
 EX,EY,EW=372,150,580
 r(EX,EY,EW,800,fill="#fff6ef",stroke=DSP,sw=2.5,rx=12)
 t(EX+EW/2,EY+30,"Matrix-vector engine",19,INK,"middle",True)
-t(EX+EW/2,EY+50,"every weight read once per token (~242 MB); 16 of the chip's 24 DSP blocks",13,"#6a4a36","middle")
+t(EX+EW/2,EY+50,"every weight read once per token (~242 MB); 16 of the chip's 39 DSP blocks in use",13,"#6a4a36","middle")
 # X banks
 y=EY+70
 t(EX+20,y+14,"Input X: 16 block-RAM banks, 64 int8 values read per cycle",14,INK,bold=True)
@@ -101,8 +101,8 @@ for i in range(6):
 # dual clock RAMs
 y=EY+720
 r(EX+20,y,EW-40,64,fill="#fbe3d2",stroke="#d99a72",dash="5 4",rx=7)
-t(EX+EW/2,y+24,"dual-clock RAMs at the boundary",14,INK,"middle",True)
-t(EX+EW/2,y+46,"result mirror (engine → CPU) · input staging (CPU → X)",13,anchor="middle")
+t(EX+EW/2,y+24,"the CPU's RAM, second port: DMA unit, packer, copy-out",14,INK,"middle",True)
+t(EX+EW/2,y+46,"main memory ⇄ RAM · int32 → MX into X · results → RAM",13,anchor="middle")
 # CPU domain
 CX=990
 r(CX,100,390,870,fill="#eef7f0",stroke="#93c2a0",rx=14)
@@ -116,10 +116,10 @@ t(CX+40,302,"reads main memory through a 16-byte line",13,"#6a7282")
 ln(CX+195,320,CX+195,346,w=3,end=False)
 r(CX+20,346,350,180,stroke="#2e6b40",rx=10)
 t(CX+195,376,"Vector unit",17,INK,"middle",True)
-for i,s in enumerate(["RMSNorm · QK-norm · RoPE","residual adds · MX packing for X","KV quantisation · softmax steps"]):
+for i,s in enumerate(["RMSNorm · QK-norm · RoPE","residual adds · KV quantisation","softmax (fused, streamed)"]):
     t(CX+40,404+i*21,s,13,INK)
-r(CX+40,470,16,16,fill=DSP,stroke="none",rx=3); t(CX+64,483,"one 32 × 32 multiplier",13)
-t(CX+40,510,"2–8 cycles an element, on the CPU's RAM",13,"#6a7282")
+r(CX+40,470,16,16,fill=DSP,stroke="none",rx=3); t(CX+64,483,"streamed: 1–3 cycles an element",13)
+t(CX+40,510,"on the CPU's RAM, while the CPU waits",13,"#6a7282")
 r(CX+20,546,350,112,stroke="#2e6b40",rx=10)
 t(CX+195,574,"Screen and keyboard",16,INK,"middle",True)
 t(CX+40,598,"640x480 DVI: 80 × 25 characters of 8 × 16",13,INK)
@@ -130,7 +130,7 @@ t(CX+195,697,"UART console",16,INK,"middle",True)
 t(CX+195,717,"1 Mbaud, alongside the screen",13,anchor="middle")
 r(CX+20,744,350,104,dash="5 4")
 t(CX+195,770,"clock-domain crossing",15,INK,"middle",True)
-for i,s in enumerate(["one handshake for register and","main-memory accesses; the bulk","data crosses in the dual-clock RAMs"]):
+for i,s in enumerate(["one handshake for register and","main-memory accesses; the bulk","data crosses on the RAM's second port"]):
     t(CX+195,792+i*18,s,13,anchor="middle")
 # engine <-> CPU
 ln(CX+18,232,EX+EW+4,232); t((CX+EX+EW)/2,222,"runs",12,"#3a4250","middle")

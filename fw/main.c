@@ -91,6 +91,7 @@ static uint32_t eng_waits_total;
 #define ENG_CPU(c) ((uint64_t)(c) * SYS_MHZ / MEM_MHZ)
 
 static int eng_rb;
+static int eng_running;                /* a run started and not waited for */
 void plat_eng_start(uint32_t addr, uint32_t stride, uint32_t rows, uint32_t groups, uint32_t qbits, int bank)
 {
 	/* each write crosses to the memory clock: the ones that would not
@@ -103,11 +104,13 @@ void plat_eng_start(uint32_t addr, uint32_t stride, uint32_t rows, uint32_t grou
 	if (qbits != c_qbits) { ENG_QBITS = qbits; c_qbits = qbits; }
 	if ((uint32_t)bank != c_bank) { ENG_OBANK = (uint32_t)bank; c_bank = (uint32_t)bank; }
 	ENG_CTRL = 1;
+	eng_running = 1;
 }
 
 void plat_eng_wait(void)
 {
 	while (ENG_CTRL & 1) ;
+	eng_running = 0;
 	/* the engine counts its own (memory-side) cycles; ENG_CPU() turns
 	 * them into CPU cycles where they are reported (a 64-bit division
 	 * here, ~45 times a layer, was a slow library call each) */
@@ -153,8 +156,9 @@ COLD static uint32_t vu_selftest(void)
 	uint32_t *A = S, *B = S + 520, *D = S + 1040;  /* the unit's */
 	uint32_t *A2 = S + 1560, *B2 = S + 2080, *D2 = S + 2600;   /* the loops' */
 	uint32_t seed = 777, bad = 0;
-	for (int t = 0; t < 140; t++) {
-		int op = 1 + t % 14, n = 1 + (int)((seed >> 8) % 256);
+	for (int t = 0; t < 150; t++) {
+		static const int live[] = { 1, 2, 3, 4, 5, 6, 8, 9, 10, 15 };
+		int op = live[t % 10], n = 1 + (int)((seed >> 8) % 256);
 		int32_t p0 = 0, p1 = 0;
 		seed = seed * 1103515245u + 12345u;
 		switch (op) {
@@ -163,12 +167,9 @@ COLD static uint32_t vu_selftest(void)
 		case MLM_VU_RSHR: p0 = (int32_t)((seed >> 26) % 40) - 10; break;
 		case MLM_VU_RESID: p0 = 1 + (int32_t)(seed >> 28); p1 = 1 + (int32_t)((seed >> 24) & 15); break;
 		case MLM_VU_MULSHR30: p0 = (int32_t)(seed >> 2); break;
-		case MLM_VU_QPACK: p0 = (int32_t)(seed >> 27); p1 = (n + 9) & ~1; break;
 		case MLM_VU_KVQ8: n &= ~3; if (!n) n = 4; p0 = (int32_t)(seed >> 28); p1 = (int32_t)((seed >> 8) % (127u << 16)); break;
 		case MLM_VU_ROPE: n = 128; p0 = (int32_t)(seed >> 31); break;
 		case MLM_VU_ATTSC: p0 = (int32_t)((seed >> 20) % 61) - 30; break;
-		case MLM_VU_QPACKU: p0 = (int32_t)((seed >> 26) % 30) - 10; p1 = (n + 9) & ~1; break;
-		case MLM_VU_MXPACK: p1 = (n + 31) & ~31; break;
 		default: break;
 		}
 		for (int i = 0; i < 520; i++) {
@@ -182,26 +183,20 @@ COLD static uint32_t vu_selftest(void)
 			D[i] = D2[i] = 0;
 			/* attention: scale words (16-bit mantissa, small exponent),
 			 * softmax inputs near their maximum, exponentials up to 1.0 */
-			if (op == MLM_VU_ATTSC || op == MLM_VU_COEF)
+			if (op == MLM_VU_ATTSC || op == MLM_VU_EXPCOEF)
 				B[i] = B2[i] = (x & 0xffff) | ((uint32_t)(uint16_t)((int)((x >> 20) % 61) - 40) << 16);
-			if (op == MLM_VU_EXPSUM) A[i] = A2[i] = (uint32_t)(-(int32_t)((x >> 8) % (20u << 16)));
-			if (op == MLM_VU_COEF) A[i] = A2[i] = (x >> 7) % 65537;
+			if (op == MLM_VU_EXPCOEF) A[i] = A2[i] = (uint32_t)(-(int32_t)((x >> 8) % (20u << 16)));
 		}
-		if (op == MLM_VU_EXPSUM) p0 = 0;           /* every input is <= 0 */
-		if (op == MLM_VU_COEF) p0 = 20;            /* every exponent is <= 20 */
+		if (op == MLM_VU_EXPCOEF) { p0 = 0; p1 = 20; }
 		int inpl = (op == MLM_VU_RESID || op == MLM_VU_ROPE || op == MLM_VU_ATTSC ||
-		            op == MLM_VU_EXPSUM || op == MLM_VU_COEF);
+		            op == MLM_VU_EXPCOEF);
 		uint64_t s1 = 0, s2 = 0;
 		uint32_t r1 = fw_vu(op, A, B, inpl ? A : D, (uint32_t)n, p0, p1, &s1);
 		uint32_t r2 = mlm_vu_ref(op, A2, B2, inpl ? A2 : D2, (uint32_t)n, p0, p1, &s2);
 		int wrong = 0;
 		for (int i = 0; i < 520; i++) if (A[i] != A2[i] || D[i] != D2[i]) wrong = 1;
-		if (op == MLM_VU_MXPACK) {
-			for (int i = 0; i < 520; i++) if (B[i] != B2[i]) wrong = 1;
-			if (r1 != r2) wrong = 1;
-		}
-		if ((op == MLM_VU_MAXABS || op == MLM_VU_RESID || op == MLM_VU_ATTSC || op == MLM_VU_COEF) && r1 != r2) wrong = 1;
-		if ((op == MLM_VU_SQMUL || op == MLM_VU_EXPSUM) && s1 != s2) wrong = 1;
+		if ((op == MLM_VU_MAXABS || op == MLM_VU_RESID || op == MLM_VU_ATTSC || op == MLM_VU_EXPCOEF) && r1 != r2) wrong = 1;
+		if ((op == MLM_VU_SQMUL || op == MLM_VU_EXPCOEF) && s1 != s2) wrong = 1;
 		if (wrong) { puts_(" [op "); put_dec((uint32_t)op); puts_(" n "); put_dec((uint32_t)n);
 		             puts_(" p0 "); put_dec((uint32_t)p0); puts_("]"); }
 		bad += (uint32_t)wrong;
@@ -253,7 +248,7 @@ COLD static void prof_report(void)
 {
 	static const char *nm[MLM_PROF_N] = { "norm", "qkv", "qknorm+rope", "kv store", "attention",
 		"wo+res", "ffn gate", "ffn up+mul", "ffn down+res", "head", "silu (w3 running)",
-		"(of these: packing inputs)", "(of these: reading results)" };
+		"packing inputs", "reading results" };
 	plat_prof(MLM_PROF_HEAD);
 	prof_cur = -1;
 	for (int i = 0; i < MLM_PROF_N; i++) {
@@ -283,46 +278,72 @@ int32_t plat_eng_out32(uint32_t i, int sh)
 	return ((volatile int32_t *)(ENG_BASE + (eng_rb ? 0x14000 : 0x10000)))[i];
 }
 
-/* the engine's input: into the staging RAM at RAM speed, then the
- * engine copies it (a word a cycle); waits for it, as a run must not
+/* the engine's input: its packer reads v from the RAM and writes X
+ * (both passes, a word a memory cycle each); waits, as a run must not
  * start before X is complete */
-void plat_eng_xload(const uint32_t *q, int nw, const uint32_t *d, int nb)
+int plat_eng_xpack(const int32_t *v, int n, int padn)
 {
-	volatile uint32_t *st = (volatile uint32_t *)ENG_XSTAGE;
-	int j = 0;
-	for (; j + 4 <= nw; j += 4) {
-		uint32_t a0 = q[j], a1 = q[j + 1], a2 = q[j + 2], a3 = q[j + 3];
-		st[j] = a0; st[j + 1] = a1; st[j + 2] = a2; st[j + 3] = a3;
-	}
-	for (; j < nw; j++) st[j] = q[j];
-	for (int b = 0; b < nb; b++) st[768 + b] = d[b];
-	ENG_CI_GO = (uint32_t)nw | ((uint32_t)nb << 16);
+	ENG_PK_SRC = (uint32_t)v >> 2;
+	ENG_PK_GO = (uint32_t)n | ((uint32_t)(padn / 32) << 16);
 	while (ENG_CTRL & 4) ;
+	return (int)ENG_PK_S - 15;
 }
 
-/* n rows from i0 through the engine's copy-out and the mirror, 2048 at a
- * time: one crossing to start, then reads at RAM speed */
+/* n rows from i0 through the engine's copy-out, straight into dst in the
+ * RAM, 2048 at a time (a run may go on meanwhile) */
 void plat_eng_out32_block(int32_t *dst, uint32_t i0, uint32_t n, int sh)
 {
 	if (sh != eng_cur_sh) { ENG_SHIFT = (uint32_t)sh; eng_cur_sh = sh; }
-	const volatile int32_t *mir = (const volatile int32_t *)ENG_MIRROR;
 	while (n) {
 		uint32_t c = n > 2048 ? 2048 : n;
+		ENG_CO_DST = (uint32_t)dst >> 2;
 		ENG_CO_ROW = ((uint32_t)eng_rb << 12) | i0;
 		ENG_CO_GO = c;
-		while (ENG_CTRL & 2) ;          /* bit 1: the copy-out (a run may go on) */
-		/* eight loads, then eight stores: the CPU waits on each load's
-		 * answer, not on the loop */
-		uint32_t k = 0;
-		for (; k + 8 <= c; k += 8) {
-			int32_t a0 = mir[k], a1 = mir[k + 1], a2 = mir[k + 2], a3 = mir[k + 3];
-			int32_t a4 = mir[k + 4], a5 = mir[k + 5], a6 = mir[k + 6], a7 = mir[k + 7];
-			dst[k] = a0; dst[k + 1] = a1; dst[k + 2] = a2; dst[k + 3] = a3;
-			dst[k + 4] = a4; dst[k + 5] = a5; dst[k + 6] = a6; dst[k + 7] = a7;
-		}
-		for (; k < c; k++) dst[k] = mir[k];
+		while (ENG_CTRL & 2) ;          /* bit 1: the copy-out */
 		dst += c; i0 += c; n -= c;
 	}
+}
+
+/* main memory <-> RAM (rtl/mlm_dma.v). A read uses the memory stream,
+ * so only while no run is going; otherwise, or for a few words or an
+ * odd address, the CPU copies. */
+static int dma_pending;
+void plat_dma_wait(void)
+{
+	if (dma_pending) { while (DMA_GO & 1) ; dma_pending = 0; }
+}
+void plat_mem_rd(void *dst, uint32_t off, uint32_t nw)
+{
+	plat_dma_wait();
+	if (nw >= 8 && !(off & 15) && !eng_running) {
+		DMA_SRC = off; DMA_DST = (uint32_t)dst; DMA_N = nw;
+		DMA_GO = 1;
+		while (DMA_GO & 1) ;
+		return;
+	}
+	const volatile uint32_t *s = (const volatile uint32_t *)(MAIN_BASE + off);
+	uint32_t *d = (uint32_t *)dst, k = 0;
+	for (; k + 8 <= nw; k += 8) {
+		uint32_t a0 = s[k], a1 = s[k + 1], a2 = s[k + 2], a3 = s[k + 3];
+		uint32_t a4 = s[k + 4], a5 = s[k + 5], a6 = s[k + 6], a7 = s[k + 7];
+		d[k] = a0; d[k + 1] = a1; d[k + 2] = a2; d[k + 3] = a3;
+		d[k + 4] = a4; d[k + 5] = a5; d[k + 6] = a6; d[k + 7] = a7;
+	}
+	for (; k < nw; k++) d[k] = s[k];
+}
+void plat_mem_wblk(uint32_t off, const void *src, uint32_t nblk)
+{
+	plat_dma_wait();
+	DMA_SRC = (uint32_t)src; DMA_DST = off; DMA_N = nblk; DMA_OUTER = 1;
+	DMA_GO = 2;
+	dma_pending = 1;
+}
+void plat_mem_wcol(uint32_t off, const void *src, uint32_t n, uint32_t stride)
+{
+	plat_dma_wait();
+	DMA_SRC = (uint32_t)src; DMA_DST = off; DMA_N = n; DMA_STRIDE = stride; DMA_OUTER = 1;
+	DMA_GO = 3;
+	dma_pending = 1;
 }
 
 uint32_t plat_sd_rd(int reg) { return ((volatile uint32_t *)SD_BASE)[reg]; }
@@ -652,7 +673,7 @@ COLD static int selftest(void)
 	uint32_t vbad = 0;
 	if (vu_present()) {
 		vbad = vu_selftest();
-		puts_("vector unit self-test: 140 operations, "); put_dec(vbad);
+		puts_("vector unit self-test: 150 operations, "); put_dec(vbad);
 		puts_(vbad ? " WRONG (:u uses the CPU instead)\n" : " wrong\n");
 	}
 	return bad == 0 && gbad == 0 && vbad == 0;

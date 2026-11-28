@@ -10,6 +10,10 @@
  * compared with eng_dot_spec(); the generated token ids are printed and
  * must equal `mlm_run -q` (the Makefile checks).
  *
+ * The packer (PK_GO) and the copy-out (CO_GO) work on a model of the
+ * CPU's RAM on the engine's second-port pins: every packing is checked
+ * against eng_mx_pack(), every copy-out against the rows' OUT32 values.
+ *
  *   tb_engine model.mlm "prompt" steps [latency] [gap%]
  *     latency  cycles from request to first block (default 14)
  *     gap%     chance of a missing block slot, to shake the FIFO (default 10)
@@ -37,7 +41,8 @@ static int64_t obufs[2][ENG_OUT_MAX];
 static int rb;
 #define obuf obufs[rb]
 static Vmlm_engine *top;
-static uint64_t cycles, busy_cycles, data_blocks, glu_cycles;
+static uint64_t cycles, busy_cycles, data_blocks, glu_cycles, packs, copyouts;
+static uint32_t pbram[24576];                 /* the CPU's RAM, as the engine's second port sees it */
 static int latency = 14, gap_pct = 10;
 static unsigned rnd = 12345;
 static unsigned rr() { rnd = rnd * 1103515245u + 12345u; return rnd >> 8; }
@@ -65,7 +70,14 @@ static void tick()
 	top->clk = 0; top->eval();
 	bool take = top->sq_valid && top->sq_ready;
 	uint32_t blk = top->sq_blk, len = top->sq_len;
+	// the RAM: a write, and the read address's word registered at the edge
+	// (registered again, as the SOC does: the data a cycle later)
+	static uint32_t pq0;
+	uint32_t pra = top->pb_ra % 24576, pq = pq0;
+	pq0 = pbram[pra];
+	if (top->pb_we) pbram[top->pb_wa % 24576] = top->pb_wd;
 	top->clk = 1; top->eval();
+	top->pb_q = pq; top->eval();
 	if (take) rq.push_back({blk, len, cycles + (uint64_t)latency});
 	cycles++;
 }
@@ -119,10 +131,64 @@ void plat_eng_xload(const uint32_t *q, int nw, const uint32_t *d, int nb)
 	for (int j = 0; j < nw; j++) x[j] = q[j];
 	for (int b = 0; b < nb; b++) xd[b] = d[b];
 }
+/* the packer: v into the RAM model, PK_GO, then X read back over the
+ * bus against eng_mx_pack() */
+int plat_eng_xpack(const int32_t *v, int n, int padn)
+{
+	const uint32_t base = 4096;
+	static int8_t q[ENG_X_MAX];
+	static uint8_t xd[ENG_X_MAX / 32];
+	for (int i = 0; i < n; i++) pbram[base + i] = (uint32_t)v[i];
+	for (int i = n; i < padn; i++) pbram[base + i] = 0xdeadbeef;   /* never read */
+	int sx = eng_mx_pack(v, n, padn, q, xd);
+	bus(true, 0x4058, base);
+	bus(true, 0x4050, (uint32_t)n | ((uint32_t)(padn / 32) << 16));
+	int k = 0;
+	while (bus(false, 0x4014, 0) & 4) if (++k > 100000) { fprintf(stderr, "packer timeout\n"); exit(1); }
+	int hs = (int)bus(false, 0x4060, 0) - 15;
+	int bad = (hs != sx);
+	for (int w = 0; w < padn / 4; w++) {
+		uint32_t want;
+		memcpy(&want, q + 4 * w, 4);
+		if (bus(false, 4 * w, 0) != want) bad++;
+	}
+	for (int b = 0; b < padn / 32; b++) if ((bus(false, 0x1000 + 4 * b, 0) & 15) != xd[b]) bad++;
+	if (bad) { fprintf(stderr, "PACKER MISMATCH n %d padn %d: %d (s %d want %d)\n", n, padn, bad, hs, sx); exit(1); }
+	memcpy(xshadow, q, (size_t)padn);
+	for (int b = 0; b < padn / 32; b++) xdshadow[b] = xd[b];
+	packs++;
+	return sx;
+}
+/* the copy-out into the RAM model, against the rows' values */
 void plat_eng_out32_block(int32_t *dst, uint32_t i0, uint32_t n, int sh)
 {
-	for (uint32_t k = 0; k < n; k++) dst[k] = plat_eng_out32(i0 + k, sh);
+	const uint32_t base = 8192;
+	bus(true, 0x4028, (uint32_t)sh);
+	while (n) {
+		uint32_t c = n > 2048 ? 2048 : n;
+		bus(true, 0x4054, base);
+		bus(true, 0x404c, ((uint32_t)rb << 12) | i0);
+		bus(true, 0x4048, c);
+		int k = 0;
+		while (bus(false, 0x4014, 0) & 2) if (++k > 100000) { fprintf(stderr, "copy-out timeout\n"); exit(1); }
+		for (uint32_t j = 0; j < c; j++) {
+			int64_t v = obuf[i0 + j];
+			if (sh > 0) v = (v + ((int64_t)1 << (sh - 1))) >> sh;
+			if ((int32_t)pbram[base + j] != (int32_t)v) { fprintf(stderr, "COPY-OUT MISMATCH row %u\n", i0 + j); exit(1); }
+			dst[j] = (int32_t)v;
+		}
+		copyouts++;
+		dst += c; i0 += c; n -= c;
+	}
 }
+/* main memory <-> RAM: immediate here */
+void plat_mem_rd(void *dst, uint32_t off, uint32_t nw) { memcpy(dst, mem + off, 4 * nw); }
+void plat_mem_wblk(uint32_t off, const void *src, uint32_t nblk) { memcpy(mem + off, src, 16 * nblk); }
+void plat_mem_wcol(uint32_t off, const void *src, uint32_t n, uint32_t stride)
+{
+	for (uint32_t k = 0; k < n; k++) mem[off + k * stride] = ((const uint8_t *)src)[k];
+}
+void plat_dma_wait(void) {}
 
 /* runs: start writes the registers; wait polls, then reads every row
  * of the bank back (64-bit) and checks it against the specification */
@@ -277,10 +343,10 @@ int main(int argc, char **argv)
 	}
 	printf("\n");
 	fprintf(stderr, "%u engine calls, %llu rows, %llu engine busy cycles, %llu blocks "
-	        "(%.2f words/cycle while busy), %llu total cycles\n",
+	        "(%.2f words/cycle while busy), %llu total cycles; %llu packs and %llu copy-outs checked\n",
 	        m.n_dot, (unsigned long long)m.dot_rows, (unsigned long long)busy_cycles,
 	        (unsigned long long)data_blocks, 2.0 * data_blocks / (double)busy_cycles,
-	        (unsigned long long)cycles);
+	        (unsigned long long)cycles, (unsigned long long)packs, (unsigned long long)copyouts);
 	delete top;
 	return 0;
 }

@@ -3,7 +3,7 @@
 #               the generated text must equal mlm_run's
 ROOT = ../..
 Z = $(ROOT)/ext/zeitlos/rtl
-RTL = $(ROOT)/rtl/mlm_soc.v $(ROOT)/rtl/mlm_ui.v $(ROOT)/rtl/mlm_vu.v $(ROOT)/rtl/mlm_engine.v $(ROOT)/rtl/mlm_mul16r.v $(ROOT)/rtl/mlm_mul18s.v $(ROOT)/rtl/mlm_uart.v $(ROOT)/rtl/sd/mlm_sd.v \
+RTL = $(ROOT)/rtl/mlm_soc.v $(ROOT)/rtl/mlm_dma.v $(ROOT)/rtl/mlm_ui.v $(ROOT)/rtl/mlm_vu.v $(ROOT)/rtl/mlm_engine.v $(ROOT)/rtl/mlm_mul16r.v $(ROOT)/rtl/mlm_mul18s.v $(ROOT)/rtl/mlm_uart.v $(ROOT)/rtl/sd/mlm_sd.v \
       $(ROOT)/rtl/mem/mlm_ddr3_ctrl.v $(ROOT)/sim/mem/mlm_dram_model.v \
       $(Z)/cpu/zeitlos32ps/zeitlos32ps.v $(Z)/cpu/zeitlos32ps/zeitlos32ps_alu.v \
       $(Z)/cpu/zeitlos32/zeitlos32_decode.v $(Z)/cpu/zeitlos32/zeitlos32_lsu.v \
