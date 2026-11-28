@@ -12,6 +12,10 @@
  *   -x "1 2 3"   feed these token ids instead of a prompt
  *   -d           per step: position, chosen token, top 5 with logits
  *   -q           print only the token ids (for comparisons)
+ *   -rw N        a test of mlm_rewind: after half of the prompt, N other
+ *                tokens are read and rewound (the output must not change)
+ *   -chat        the prompt as a Qwen3 chat turn, non-thinking (as the
+ *                firmware); -think: the thinking turn
  */
 
 #include <stdio.h>
@@ -112,7 +116,7 @@ static void put_tok(mlm_ctx_t *m, uint32_t prev, uint32_t tok)
 int main(int argc, char **argv)
 {
 	const char *path = 0, *prompt = "", *ids = 0;
-	int steps = 64, ctx = 0, dump = 0, quiet = 0;
+	int steps = 64, ctx = 0, dump = 0, quiet = 0, chat = 0, rw = 0;
 	double temp = 0.0, topp = 0.9;
 	uint32_t seed = 1;
 	for (int i = 1; i < argc; i++) {
@@ -125,6 +129,9 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "-x") && i + 1 < argc) ids = argv[++i];
 		else if (!strcmp(argv[i], "-d")) dump = 1;
 		else if (!strcmp(argv[i], "-q")) quiet = 1;
+		else if (!strcmp(argv[i], "-chat")) chat = 1;
+		else if (!strcmp(argv[i], "-rw") && i + 1 < argc) rw = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-think")) chat = 2;
 		else path = argv[i];
 	}
 	if (!path) { fprintf(stderr, "usage: mlm_run model.mlm [options]\n"); return 1; }
@@ -154,6 +161,30 @@ int main(int argc, char **argv)
 	if (ids) {
 		char *s = strdup(ids), *tk = strtok(s, " ,");
 		while (tk && nt < 1024) { toks[nt++] = (uint32_t)atoi(tk); tk = strtok(0, " ,"); }
+	} else if (chat && prompt[0]) {
+		/* fw/main.c's chat turn */
+		nt = 0;
+		toks[nt++] = h->im_start_id;
+		nt += mlm_encode(&m, "user\n", toks + nt, 1000 - nt);
+		nt += mlm_encode(&m, prompt, toks + nt, 1000 - nt);
+		toks[nt++] = h->im_end_id;
+		nt += mlm_encode(&m, "\n", toks + nt, 1000 - nt);
+		toks[nt++] = h->im_start_id;
+		nt += mlm_encode(&m, "assistant\n", toks + nt, 1000 - nt);
+		if (h->think_id != 0xffffffffu) {
+			toks[nt++] = h->think_id;
+			if (chat == 2) {
+				nt += mlm_encode(&m, "\n", toks + nt, 1000 - nt);
+				/* the reasoning's first words (THINK_PREFIX: others) */
+				const char *tp = getenv("THINK_PREFIX") ? getenv("THINK_PREFIX") : MLM_THINK_PREFIX;
+				nt += mlm_encode(&m, tp, toks + nt, 1000 - nt);
+			}
+			else {
+				nt += mlm_encode(&m, "\n\n", toks + nt, 1000 - nt);
+				toks[nt++] = h->think_end_id;
+				nt += mlm_encode(&m, "\n\n", toks + nt, 1000 - nt);
+			}
+		}
 	} else if (prompt[0]) {
 		nt += mlm_encode(&m, prompt, toks + nt, 1024 - nt);
 	}
@@ -163,6 +194,11 @@ int main(int argc, char **argv)
 	uint32_t prev = h->bos_id, tok = toks[0];
 	int gen = 0;
 	for (int i = 0; ; i++) {
+		if (rw && i == nt / 2) {
+			uint32_t p0 = m.pos;
+			for (int k = 0; k < rw; k++) mlm_step_ex(&m, (toks[k % nt] * 7 + 13 * (uint32_t)k) % h->vocab, 0);
+			mlm_rewind(&m, p0);
+		}
 		if (mlm_step_ex(&m, tok, i + 1 >= nt || dump)) break;
 		uint32_t next = (i + 1 < nt) ? toks[i + 1] : mlm_sample(&m);
 		if (dump) {
@@ -217,3 +253,4 @@ void plat_mem_wcol(uint32_t off, const void *src, uint32_t n, uint32_t stride)
 	for (uint32_t k = 0; k < n; k++) plat_mem()[off + k * stride] = ((const uint8_t *)src)[k];
 }
 void plat_dma_wait(void) {}
+void plat_poll(void) {}

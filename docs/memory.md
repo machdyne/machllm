@@ -88,7 +88,7 @@ Zeitlos's `ddr3_clk` with the clock as a parameter.
 
 | Build | DRAM | controller, engine | CPU |
 |---|---|---|---|
-| `make MEM_MHZ=90` | 180 MT/s | 90 MHz | 49.09 MHz (540 / 11) |
+| `make MEM_MHZ=90` | 180 MT/s | 90 MHz | 54 MHz (540 / 10) |
 | `make MEM_MHZ=75` | 150 MT/s | 75 MHz | 50 MHz |
 | `make` | 96 MT/s | 48 MHz, one clock domain | |
 

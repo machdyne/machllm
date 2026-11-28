@@ -8,3 +8,4 @@ obj_*/
 sim/rdasm/zeitlos_rdasm.v
 sim/ui/obj/
 sim/soc/ui_screen.txt
+data/

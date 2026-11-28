@@ -8,7 +8,7 @@ published as GGUF `Q1_0`. 4- and 8-bit weight models were dropped on
 ## Bonsai 1.7B
 
 ```
-python3 tools/mlm_convert.py gguf Bonsai-1.7B-Q1_0.gguf build/models/bonsai.mlm   # 246 MB, ~5 s
+python3 tools/mlm_convert.py gguf Bonsai-1.7B-Q1_0.gguf build/models/bonsai.mlm   # 230 MB, a few minutes
 ./ref/mlm_run build/models/bonsai.mlm -i "The capital of France is" -n 16 -t 0
 python3 tools/gguf_ref.py Bonsai-1.7B-Q1_0.gguf "ids"      # float forward pass of the GGUF
 tools/mkcard.sh /media/you/CARD build/models/bonsai.mlm
@@ -30,9 +30,29 @@ wrong on the board, it is a hardware problem.
 | | |
 |---|---|
 | layout | dim 2048, FFN 6144, 28 layers, 16 query / 8 KV heads of 128, QK-norm, tied head, vocabulary 151,669 |
-| image | 246 MB (weights ~242 MB read per token) + caches for 512 positions |
+| vocabulary in the image | 101,064 of 151,669 tokens (below) |
+| image | 230 MB (weights ~229 MB read per token) + caches for 512 positions |
 | check | same top-5 next tokens as the float pass of the GGUF, logits within ~1% |
 | sampling (firmware default) | temperature 0.5, top-k 20, top-p 0.85, as PrismML recommends; `:temp 0` for greedy |
+
+## The vocabulary, cut to what the screen shows
+
+By default the converter keeps only the tokens machllm can show:
+every special token, the 256 single bytes, every token whose text is
+ASCII, Latin (to U+024F), punctuation, currency, arrows or emoji, and
+every token a BPE merge needs on the way to one of those (so any such
+text encodes exactly as with the whole vocabulary). For Bonsai that is
+101,064 of 151,669: the rest is CJK (21%), other scripts (9%) and Greek
+and Cyrillic (3%). The output head (39 of the 242 MB read
+per token) is a third shorter: about 13 MB less read per token (~5%),
+and its top-k scan a third shorter. The model can no longer
+pick a token it could not show (the screen printed those as "?"). On
+five test questions, greedy, four English answers were identical to the
+whole vocabulary's; asked to translate into Japanese, the whole
+vocabulary writes Japanese (on the screen: "???") and the cut one,
+without those tokens, repeats an English phrase instead.
+`--vocab all` keeps every token (the serial console passes UTF-8 on, so
+a terminal there could show the rest).
 
 ## Other models
 

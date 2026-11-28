@@ -189,6 +189,7 @@ void plat_mem_wcol(uint32_t off, const void *src, uint32_t n, uint32_t stride)
 	for (uint32_t k = 0; k < n; k++) mem[off + k * stride] = ((const uint8_t *)src)[k];
 }
 void plat_dma_wait(void) {}
+void plat_poll(void) {}
 
 /* runs: start writes the registers; wait polls, then reads every row
  * of the bank back (64-bit) and checks it against the specification */

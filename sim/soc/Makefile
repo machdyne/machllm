@@ -24,6 +24,18 @@ obj_2c/Vmlm_soc: $(RTL) tb_soc.cpp ../sd/sdcard_model.h $(FW2)
 	verilator -I$(ROOT)/rtl $(subst $(abspath $(FW)),$(abspath $(FW2)),$(VFLAGS)) -GTWO_CLK=1 -GSYS_MHZ=50 -GMEM_MHZ=75 \
 		-CFLAGS "-DTB_TWO_CLK -DTB_CPU_MHZ=50 -DTB_MEM_MHZ=75 -DTB_UART_DIV=50" -Mdir obj_2c $(RTL) tb_soc.cpp
 
+# the boards' clocks and firmware (no profiler): CPU at 54 MHz, memory side at 90 (make test-board)
+FWB = $(ROOT)/build/simb/fw.hex
+obj_b/Vmlm_soc: $(RTL) tb_soc.cpp ../sd/sdcard_model.h $(FWB)
+	verilator -I$(ROOT)/rtl $(subst $(abspath $(FW)),$(abspath $(FWB)),$(VFLAGS)) -GTWO_CLK=1 -GSYS_MHZ=54 -GMEM_MHZ=90 \
+		-CFLAGS "-DTB_TWO_CLK -DTB_CPU_MHZ=54 -DTB_MEM_MHZ=90 -DTB_UART_DIV=54" -Mdir obj_b $(RTL) tb_soc.cpp
+$(FWB): $(ROOT)/fw/*.c $(ROOT)/fw/*.h $(ROOT)/fw/common/*.c $(ROOT)/fw/common/*.h
+	$(MAKE) -C $(ROOT)/fw OUT=../build/simb SYS_MHZ=54 MEM_MHZ=90 PROFILE=0 CFLAGS_EXTRA="-DSIM -DSIM_UART_DIV=54" all
+test-board: obj_b/Vmlm_soc $(IMG)
+	obj_b/Vmlm_soc $(IMG) "$(PROMPT)" | tee /tmp/soc_outb.txt
+	$(ROOT)/ref/mlm_run $(MODEL) -i "$(PROMPT)" -n 24 > /tmp/soc_want.txt 2>/dev/null
+	python3 compare.py /tmp/soc_outb.txt /tmp/soc_want.txt "$(PROMPT)"
+
 # the same with the screen and keyboard (UI = 1); at the end the screen's
 # cells go to ui_screen.txt
 obj_ui/Vmlm_soc: $(RTL) tb_soc.cpp ../sd/sdcard_model.h $(FW2) $(ROOT)/rtl/mlm_hid_rom.v

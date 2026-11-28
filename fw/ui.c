@@ -273,11 +273,32 @@ void ui_clear(void)
 	text(11, 32, "Ask me anything.", C_TEXT);
 	text(13, 24, "Type a question and press Enter.", C_DIM);
 	crow = 2;
+	fresh = 1;                         /* (cleared by the next question) */
 }
+static int think_on;
+void ui_set_think(int on) { think_on = on; }
 void ui_ready(void)
 {
 	if (!ui_on) return;
-	ui_status("Enter: ask    Esc: clear    F1: new conversation");
+	ui_status(think_on ? "Enter: ask   Esc: clear   F1: new   F2: thinking (on)   F10: exit"
+	                   : "Enter: ask   Esc: clear   F1: new   F2: thinking (off)   F10: exit");
+}
+/* the model's reasoning (thinking mode): dimmed, then the answer */
+void ui_think_begin(void)
+{
+	if (!ui_on) return;
+	cursor(0);
+	ccolour = C_DIM;
+	cursor(1);
+}
+void ui_think_end(void)
+{
+	if (!ui_on) return;
+	cursor(0);
+	ccolour = C_TEXT;
+	if (ccol > LEFT) newline();
+	newline();
+	cursor(1);
 }
 
 /* ---------------------------------------------------------------- */
@@ -292,6 +313,8 @@ static uint64_t k_next;
 static int to_char(int code, uint32_t mods)
 {
 	if (code == 0x3a) return UI_F1;
+	if (code == 0x43) return UI_F10;
+	if (code == 0x3b) return UI_F2;
 	if (code < 0x04 || code > 0x38) return -1;
 	int shift = (mods & 0x22) != 0;
 	int ch = shift ? k_hi[code - 4] : k_lo[code - 4];
@@ -330,7 +353,7 @@ int ui_key(void)
 	/* repeat while a key stays down */
 	if (k_held && in_report(keys, k_held) && now() >= k_next) {
 		k_next = now() + MS(40);
-		if (k_held == 0x29 || k_held == 0x28 || k_held == 0x3a) return -1;   /* not Esc, Enter, F1 */
+		if (k_held == 0x29 || k_held == 0x28 || k_held == 0x3a || k_held == 0x3b || k_held == 0x43) return -1;   /* not Esc, Enter, F keys */
 		return to_char(k_held, keys & 0xff);
 	}
 	return -1;

@@ -16,6 +16,8 @@
 #define SYS_ID      REG(0x70000004)
 #define SYS_BUILD   REG(0x70000008)
 #define SYS_LINE    REG(0x7000000c)  /* bit 0: keep main memory's last read line (rtl/mlm_soc.v) */
+#define SYS_RECONFIG REG(0x70000010) /* write the key: PROGRAMN low, the FPGA reloads (machboot) */
+#define RECONFIG_KEY 0x5a524254u     /* "ZRBT", as Zeitlos */
 
 #define DDR3_STATUS REG(0x70000700)
 #define DDR3_TUNE   REG(0x70000704)
@@ -35,8 +37,12 @@
 #define MEM_MHZ SYS_MHZ
 #endif
 /* the SD host runs on the CPU's clock (in every build); its data clock
- * = SYS_MHZ / (2 (div + 1)), at most 25 MHz (default speed) */
-#define SD_FAST_DIV ((SYS_MHZ + 49) / 50 - 1)
+ * = SYS_MHZ / SD_PERIOD(div), at most 25 MHz (default speed): div + 1
+ * cycles low and as many high, one fewer high with bit 7 (odd periods:
+ * 60 MHz / 3 = 20 MHz) */
+#define SD_PERIOD(d) (((d) & 0x80) ? 2u * ((d) & 0x7f) + 1u : 2u * ((d) + 1u))
+#define SD_FAST_CYC ((SYS_MHZ + 24) / 25)
+#define SD_FAST_DIV ((SD_FAST_CYC & 1) && SD_FAST_CYC > 1 ? 0x80 | (SD_FAST_CYC >> 1) : (SD_FAST_CYC + 1) / 2 - 1)
 
 #define SD_BASE     0x72000000u
 

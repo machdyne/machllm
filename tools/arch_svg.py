@@ -25,7 +25,7 @@ t(40,128,"MEMORY CLOCK DOMAIN · 90 MHz (DDR3-180)",15,"#2f5c8a",bold=True)
 # left column
 r(40,150,270,170,stroke="#2f5c8a",sw=2,rx=10)
 t(175,180,"DDR3L · 512 MB",18,INK,"middle",True)
-t(58,210,"Bonsai 1.7B, 1-bit: 246 MB",14,INK)
+t(58,210,"Bonsai 1.7B, 1-bit: 230 MB",14,INK)
 t(58,230,"sign bits + a scale per 128 weights",13)
 t(58,256,"KV cache: int8 (V transposed)",14,INK)
 t(58,290,"x16 at 180 MT/s",13); t(58,308,"~650 MB/s streamed",13,INK,bold=True)
@@ -50,7 +50,7 @@ t(341,402,"weights",11,DSP,"middle",True); t(341,437,"64 bit",11,DSP,"middle",Tr
 EX,EY,EW=372,150,580
 r(EX,EY,EW,800,fill="#fff6ef",stroke=DSP,sw=2.5,rx=12)
 t(EX+EW/2,EY+30,"Matrix-vector engine",19,INK,"middle",True)
-t(EX+EW/2,EY+50,"every weight read once per token (~242 MB); 16 of the chip's 39 DSP blocks in use",13,"#6a4a36","middle")
+t(EX+EW/2,EY+50,"every weight read once per token (~229 MB); 16 of the chip's 39 DSP blocks in use",13,"#6a4a36","middle")
 # X banks
 y=EY+70
 t(EX+20,y+14,"Input X: 16 block-RAM banks, 64 int8 values read per cycle",14,INK,bold=True)
@@ -106,7 +106,7 @@ t(EX+EW/2,y+46,"main memory ⇄ RAM · int32 → MX into X · results → RAM",1
 # CPU domain
 CX=990
 r(CX,100,390,870,fill="#eef7f0",stroke="#93c2a0",rx=14)
-t(CX+20,128,"CPU CLOCK DOMAIN · 49 MHz",15,"#2e6b40",bold=True)
+t(CX+20,128,"CPU CLOCK DOMAIN · 54 MHz",15,"#2e6b40",bold=True)
 r(CX+20,150,350,170,stroke="#2e6b40",sw=2,rx=10)
 t(CX+195,180,"zeitlos32ps · RV32IM",18,INK,"middle",True)
 t(CX+40,208,"firmware in 96 KB block RAM, integer only:",13)

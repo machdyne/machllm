@@ -13,9 +13,17 @@ make                                 # firmware + build/sergei_ml2/machllm.bit
 make YOSYS=yowasp-yosys NEXTPNR=yowasp-nextpnr-ecp5 ECPPACK=yowasp-ecppack
 make SEED=2                          # another placement
 make MEM_MHZ=75                      # DDR3 at 150, CPU at 50 -> build/sergei_ml2_mem75/
-make MEM_MHZ=90                      # DDR3 at 180, CPU at 49.09 -> build/sergei_ml2_mem90/ (see below)
+make MEM_MHZ=90                      # DDR3 at 180, CPU at 54    -> build/sergei_ml2_mem90/ (see below)
 make MEM_MHZ=90 fwbit                # only the firmware changed: into the placed design, seconds
+make BOARD=mozart_ml2 MEM_MHZ=90     # Mozart ML2 -> build/mozart_ml2_mem90/
 ```
+
+**Mozart ML2** carries the same ML2 module, so the same pins, but its
+microSD slot wires only a 1-bit bus (no DAT1/DAT2): the firmware stays
+on one data line and loading Bonsai takes about four times as long
+(~1.5 minutes instead of ~21 s); the console says `1-bit`. Everything
+else is as on Sergei ML2. Its placement has not been tried on a board
+yet.
 
 The block RAM is synthesised with random contents (`fw_rand.hex`) and
 the firmware put in when packing (ecpbram), so `fwbit` needs only the
@@ -24,9 +32,10 @@ the release zips). With yowasp: `ECPBRAM="python3 tools/ecpbram.py"
 ECPPACK=yowasp-ecppack` (yowasp's own ecpbram lacks its database).
 `tools/timing_iter.sh 90 1 2` places seeds side by side (`soc.config`
 is then the chosen `sN.config`). At 90 MHz only some seeds meet timing;
-the Makefile's defaults are the ones that did with the screen: seed 6
-and `--placer-heap-timingweight 30 --placer-heap-critexp 4` (memory
-side 92.5 MHz, CPU 52.7; seeds 2-5 fall short). Another nextpnr
+the Makefile's defaults are the ones that did last: seed 3 and
+`--placer-heap-timingweight 30 --placer-heap-critexp 4` (memory side
+90.1 MHz, CPU 56.7). The margin is small and any change to the design
+can move it: try the seeds again (6 passed before). Another nextpnr
 version can place differently, so check `pnr.log`'s clocks.
 
 Timing is checked for speed grade 6; the log is `build/sergei_ml2/pnr.log`
@@ -50,16 +59,24 @@ The model the system is built for (1-bit weights; see
 ~248 MB file) once, on a PC:
 
 ```
-python3 tools/mlm_convert.py gguf Bonsai-1.7B-Q1_0.gguf build/models/bonsai.mlm   # 246 MB, ~5 s
+python3 tools/mlm_convert.py gguf Bonsai-1.7B-Q1_0.gguf build/models/bonsai.mlm   # 230 MB, a few minutes
 ref/mlm_run build/models/bonsai.mlm -i "The capital of France is" -n 16          # the same arithmetic on the PC
 tools/mkcard.sh /media/you/CARD build/models/bonsai.mlm                            # -> BONSAI.MLM
 ```
 
 Use the `make MEM_MHZ=90` bitstream (DDR3 at 180). The firmware samples
 as Bonsai recommends (temperature 0.5, top-p 0.85, top-k 20; `:temp 0`
-for greedy). `tools/gguf_ref.py model.gguf "ids"` is a float forward pass
+for greedy). `:think` (or F2 on the keyboard) turns on Qwen3's thinking
+mode: the model reasons step by step, shown dimmed, before it answers,
+for at most 256 tokens (`:think N`), then `</think>` is put in for it.
+Bonsai 1.7B closes an empty reasoning block at once, so the firmware
+starts it with "Okay, let me think about this carefully." Reasoning
+catches some mistakes, not all, and costs minutes per answer
+(`ref/mlm_run -think` tries it on the PC). `tools/gguf_ref.py model.gguf "ids"` is a float forward pass
 of the GGUF, to check the integer path against. `:v` prints the time per
-token by section; `:e` runs the engine on simple inputs and prints its
+token and the stack's high-water mark (the board firmware leaves out the
+per-section split for the stack's sake: `make MEM_MHZ=90 PROFILE=1 fw
+fwbit` builds one with it); `:e` runs the engine on simple inputs and prints its
 results against the CPU's (the board-side check of the multipliers);
 `:k` turns the CPU's main-memory read line off and on.
 After a restart, the first lines say whether the FPGA was reloaded or
@@ -97,10 +114,22 @@ out), a monitor on the HDMI connector shows 80 x 25 characters
 (a plain keyboard, no hub).
 
 - Type a question and press **Enter**. Long questions wrap; the input
-  grows to six lines (up to 511 characters).
-- **Esc** clears what you typed; while an answer is being written, it
-  stops it.
+  grows to six lines (up to 511 characters). While you type, the model
+  already reads each finished word, and when you pause (0.4 s) the rest
+  of the line and the chat template's end too, all but the last token:
+  if Enter follows, the answer starts at once. Echo stays immediate: the
+  keyboard is served between the model's layers. Typing on or editing
+  takes back what was read ahead, exactly; the answer is the same as
+  without type-ahead.
+- **Esc** clears what you typed; while your question is read or the
+  answer is written, it stops it (a single short press: the keyboard is
+  checked between the model's layers, every few tens of ms).
 - **F1** starts a new conversation.
+- **F2** turns thinking on or off (the status line says which): the
+  model then reasons step by step before it answers, shown dimmed, for
+  up to 256 tokens (a few minutes). It catches some mistakes, not all.
+- **F10** asks "Exit to machboot?": **Enter** returns to machboot (the
+  FPGA reloads from flash address 0), **Esc** stays.
 - The bottom line shows what is happening: "Reading your question"
   with a bar, then "Writing...".
 
@@ -138,12 +167,15 @@ a generation.
 | `:models` | list the card's models |
 | `:load N` | load model N |
 | `:ctx N` | context length (default 512; up to the image's ctx_max and 1024) |
-| `:temp T` | temperature x100 (0 = greedy, the default) |
+| `:temp T` | temperature x100 (default 50, Bonsai's recommendation, with top-p 0.85 and top-k 20; 0 = greedy) |
+| `:think [N]` | thinking on/off; with N: on, at most N tokens of reasoning (default 256) |
 | `:n N` | most tokens per answer (default 256) |
 | `:reset` | forget the conversation |
+| `:quit` | back to machboot: PROGRAMN (pin M8) pulled low, the FPGA reloads from flash address 0 |
 | `:bw` | bandwidth test again |
 | `:gap N` | DDR3 stream fallback: N idle cycles per burst (see below) |
-| `:v` | per token: cycles, engine cycles, and the time per section of the model |
+| `:v` | per token: cycles, engine cycles, the stack's peak use (and the time per section of the model in a `PROFILE=1` firmware) |
+| `:a` | type-ahead on/off (reading the question while it is typed; on by default) |
 | `:s` | self-tests: the engine against the CPU's own computation on the loaded model's rows, and the GLU unit against the CPU |
 | `:o` | CPU/engine overlap on/off: off makes every engine run finish before the CPU goes on (debugging, measurements) |
 | `:g` | SwiGLU in the engine's GLU unit (default) or on the CPU (debugging) |

@@ -477,11 +477,13 @@ def load_gguf(path, ctx):
         try: tokens[i] = bytes(b2u[c] for c in t)
         except KeyError: tokens[i] = t.encode()
         findable[i] = True
+    parts = {}                               # id -> the merges that make it
     for r, mg in enumerate(M.get('tokenizer.ggml.merges', [])):
         a, b = mg.split(' ', 1)
         t = ids.get(a + b)
-        if t is not None and t < vocab_n and scores[t] == -(1 << 30):
-            scores[t] = -r
+        if t is not None and t < vocab_n:
+            if scores[t] == -(1 << 30): scores[t] = -r
+            if a in ids and b in ids: parts.setdefault(t, []).append((ids[a], ids[b]))
     for i in range(vocab_n):
         if not tokens[i]: tokens[i] = b'<unused%d>' % i
     flags = F_ROPE_HALF | F_TOK_BPE if arch == 'qwen3' else F_TOK_BPE
@@ -500,8 +502,56 @@ def load_gguf(path, ctx):
                tied=tied, qk_norm=qk, flags=flags, bos=eos, eos=eos,
                eos2=im_e, im_start=im_s, im_end=im_e,
                think=special.get('<think>', NONE), think_end=special.get('</think>', NONE),
-               yarn=yarn)
+               yarn=yarn, merge_parts=parts, special_ids=set(special.values()))
     return cfg, get, tokens, scores, findable
+
+# ------------------------------------------------------------------
+# the vocabulary, cut to what machllm can show
+
+def displayable(cp):
+    """characters the screen shows or will (ASCII, Latin, punctuation,
+    currency, emoji)"""
+    return (cp < 0x250 or 0x2000 <= cp < 0x2070 or 0x20a0 <= cp < 0x20d0
+            or cp in (0x2122, 0x2212, 0x221e, 0xfe0f)
+            or 0x2190 <= cp < 0x2200 or 0x2600 <= cp < 0x27c0 or 0x1f000 <= cp < 0x1fb00)
+
+def vocab_keep(cfg, tokens):
+    """the ids to keep: the specials, every single byte, every token
+    whose text is all displayable, and every token a merge needs on
+    the way to one of those (so displayable text encodes exactly as
+    with the whole vocabulary)"""
+    keep = set(cfg.get('special_ids', ()))
+    for i, t in enumerate(tokens):
+        if len(t) == 1: keep.add(i); continue
+        try: u = t.decode('utf-8')
+        except UnicodeDecodeError: continue
+        if all(displayable(ord(c)) for c in u): keep.add(i)
+    parts, todo = cfg.get('merge_parts', {}), list(keep)
+    while todo:
+        for a, b in parts.get(todo.pop(), ()):
+            for x in (a, b):
+                if x not in keep: keep.add(x); todo.append(x)
+    return sorted(keep)
+
+def trim_vocab(cfg, get, tokens, scores, findable, keep):
+    """the model with only the ids in keep (in order), renumbered: the
+    embedding's and the head's rows and the tokenizer; a token the model
+    can no longer write is one it could not show"""
+    new = {o: n for n, o in enumerate(keep)}
+    idx = np.asarray(keep)
+    def sub(x):
+        if isinstance(x, tuple): return (x[0], x[1][idx], x[2][idx])
+        return np.asarray(x)[idx]
+    def get2(n, l=None):
+        x = get(n, l) if l is not None else get(n)
+        return sub(x) if n in ('emb', 'head') else x
+    cfg = dict(cfg, vocab=len(keep))
+    for k in ('bos', 'eos', 'eos2', 'im_start', 'im_end', 'think', 'think_end'):
+        if cfg.get(k, NONE) != NONE:
+            assert cfg[k] in new, k
+            cfg[k] = new[cfg[k]]
+    return (cfg, get2, [tokens[i] for i in keep], [scores[i] for i in keep],
+            [findable[i] for i in keep])
 
 # ------------------------------------------------------------------
 
@@ -511,6 +561,9 @@ def main():
     ap.add_argument('inputs', nargs='+')
     ap.add_argument('--ctx', type=int, default=2048)
     ap.add_argument('--name')
+    ap.add_argument('--vocab', choices=['display', 'all'], default='display',
+                    help='gguf: keep only the tokens machllm can show (display, '
+                    'the default; their head rows are all the engine reads) or all')
     ap.add_argument('--dequant-bin', help='llama2c only: also write the 1-bit weights '
                     'back as a float llama2.c checkpoint (to separate quantisation error '
                     'from arithmetic error)')
@@ -519,6 +572,11 @@ def main():
     if a.kind == 'gguf':
         cfg, get, tokens, scores, findable = load_gguf(a.inputs[0], a.ctx)
         name = a.name or os.path.splitext(os.path.basename(a.inputs[0]))[0]
+        if a.vocab == 'display':
+            keep = vocab_keep(cfg, tokens)
+            sys.stderr.write('vocabulary: %d of %d tokens kept (--vocab all keeps every one)\n'
+                             % (len(keep), len(tokens)))
+            cfg, get, tokens, scores, findable = trim_vocab(cfg, get, tokens, scores, findable, keep)
     elif a.kind == 'llama2c':
         cfg, get, tokens, scores, findable = load_llama2c(a.inputs[0], a.inputs[1])
         cfg['ctx'] = min(cfg['ctx'], a.ctx)

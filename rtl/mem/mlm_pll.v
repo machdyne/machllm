@@ -6,7 +6,7 @@
  * or 200 from the 48 MHz oscillator:
  *   128: 48 / 3 x 8  = 128, VCO 640 (CLKOP_DIV 5), CLKOS2 640/13 = 49.2
  *   150: 48 / 8 x 25 = 150, VCO 600 (CLKOP_DIV 4), CLKOS2 600/12 = 50
- *   180: 48 / 4 x 15 = 180, VCO 540 (CLKOP_DIV 3), CLKOS2 540/11 = 49.09
+ *   180: 48 / 4 x 15 = 180, VCO 540 (CLKOP_DIV 3), CLKOS2 540/10 = 54 (the CPU's clock; 540/9 = 60 misses timing in the CPU's load path)
  *   200: 48 / 6 x 25 = 200, VCO 600 (CLKOP_DIV 3), CLKOS2 600/12 = 50
  */
 `default_nettype none
@@ -22,7 +22,7 @@ module mlm_pll #(
 	localparam CLKI_DIV  = (EDGE_MHZ == 200) ? 6 : (EDGE_MHZ == 180) ? 4 : (EDGE_MHZ == 128) ? 3 : 8;
 	localparam CLKOP_DIV = (EDGE_MHZ == 200 || EDGE_MHZ == 180) ? 3 : (EDGE_MHZ == 128) ? 5 : 4;
 	localparam CLKFB_DIV = (EDGE_MHZ == 180) ? 15 : (EDGE_MHZ == 128) ? 8 : 25;
-	localparam OS2_DIV   = (EDGE_MHZ == 180) ? 11 : (EDGE_MHZ == 128) ? 13 : 12;
+	localparam OS2_DIV   = (EDGE_MHZ == 180) ? 10 : (EDGE_MHZ == 128) ? 13 : 12;
 	localparam OS3_DIV   = (EDGE_MHZ == 180) ? 45 : (EDGE_MHZ == 128) ? 53 : 50;
 	(* ICP_CURRENT="12" *) (* LPF_RESISTOR="8" *) (* MFG_ENABLE_FILTEROPAMP="1" *) (* MFG_GMCREF_SEL="2" *)
 	EHXPLLL #(

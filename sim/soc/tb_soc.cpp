@@ -48,6 +48,14 @@ extern "C" void dram_fail(int code, long long t)
 static int rx_state = -1, rx_cnt, rx_byte;
 static std::string out, typed;
 static size_t tx_pos;
+/* TB_TYPE_GAP=N: N cycles between the characters of the last line, as
+ * a person types (the firmware reads the question ahead meanwhile);
+ * "~" in it is a backspace */
+static uint64_t tx_gap, tx_wait;
+/* TB_TYPE_PAUSE=N: and N cycles before its Enter and at each "|" in it
+ * (not typed; the firmware reads the rest of the line and the template's
+ * end ahead in a pause) */
+static uint64_t tx_pause;
 static int tx_bit = -1, tx_cnt;
 
 static long framing_errors = 0;
@@ -66,11 +74,16 @@ static void uart_step()
 		}
 	}
 	// to the SOC
-	if (tx_bit < 0 && tx_pos < typed.size()) { tx_bit = 0; tx_cnt = DIV; }
+	if (!tx_wait && tx_bit < 0 && tx_pos < typed.size() && typed[tx_pos] == '|' && tx_pause) {
+		tx_pos++; tx_wait = tx_pause;
+	}
+	if (tx_wait) tx_wait--;
+	else if (tx_bit < 0 && tx_pos < typed.size()) { tx_bit = 0; tx_cnt = DIV; }
 	if (tx_bit >= 0) {
 		int c = (unsigned char)typed[tx_pos];
 		top->uart_rx = tx_bit == 0 ? 0 : tx_bit <= 8 ? (c >> (tx_bit - 1)) & 1 : 1;
-		if (--tx_cnt == 0) { tx_cnt = DIV; if (++tx_bit == 10) { tx_bit = -1; tx_pos++; } }
+		if (--tx_cnt == 0) { tx_cnt = DIV; if (++tx_bit == 10) { tx_bit = -1; tx_pos++;
+			tx_wait = tx_pos + 1 == typed.size() && tx_pause ? tx_pause : tx_gap; } }
 	} else top->uart_rx = 1;
 }
 
@@ -141,8 +154,19 @@ int main(int argc, char **argv)
 	size_t mark = 0;
 	while (cycles < maxc) {
 		tick();
+		if (top->reconfig) {
+			fprintf(stderr, "\n[tb_soc: PROGRAMN pulled low after %llu cycles: the FPGA would reload]\n",
+			        (unsigned long long)cycles);
+			break;
+		}
 		if (phase < 4 && out.size() > mark + 1 && out.compare(out.size() - 2, 2, "> ") == 0) {
 			typed = lines[phase] + "\r"; tx_pos = 0; phase++; mark = out.size();
+			tx_gap = tx_pause = 0;
+			if (phase == 4 && getenv("TB_TYPE_PAUSE")) tx_pause = strtoull(getenv("TB_TYPE_PAUSE"), 0, 10);
+			if (phase == 4 && getenv("TB_TYPE_GAP")) {
+				tx_gap = strtoull(getenv("TB_TYPE_GAP"), 0, 10);
+				for (auto &c : typed) if (c == '~') c = 8;
+			}
 		} else if (phase == 4 && out.size() > mark + 4 && out.compare(out.size() - 2, 2, "> ") == 0) {
 			fprintf(stderr, "\n[tb_soc: done after %llu cycles, %llu card blocks]\n",
 			        (unsigned long long)cycles, (unsigned long long)card.blocks);

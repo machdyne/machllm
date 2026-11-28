@@ -12,7 +12,7 @@
 <text x="40" y="128" font-size="15" fill="#2f5c8a" text-anchor="start" font-weight="700">MEMORY CLOCK DOMAIN · 90 MHz (DDR3-180)</text>
 <rect x="40" y="150" width="270" height="170" rx="10" fill="#fff" stroke="#2f5c8a" stroke-width="2"/>
 <text x="175" y="180" font-size="18" fill="#1b1f27" text-anchor="middle" font-weight="700">DDR3L · 512 MB</text>
-<text x="58" y="210" font-size="14" fill="#1b1f27" text-anchor="start">Bonsai 1.7B, 1-bit: 246 MB</text>
+<text x="58" y="210" font-size="14" fill="#1b1f27" text-anchor="start">Bonsai 1.7B, 1-bit: 230 MB</text>
 <text x="58" y="230" font-size="13" fill="#4a5262" text-anchor="start">sign bits + a scale per 128 weights</text>
 <text x="58" y="256" font-size="14" fill="#1b1f27" text-anchor="start">KV cache: int8 (V transposed)</text>
 <text x="58" y="290" font-size="13" fill="#4a5262" text-anchor="start">x16 at 180 MT/s</text>
@@ -39,7 +39,7 @@
 <text x="341" y="451" font-size="11" fill="#c2561a" text-anchor="middle" font-weight="700">/ cycle</text>
 <rect x="372" y="150" width="580" height="800" rx="12" fill="#fff6ef" stroke="#c2561a" stroke-width="2.5"/>
 <text x="662.0" y="180" font-size="19" fill="#1b1f27" text-anchor="middle" font-weight="700">Matrix-vector engine</text>
-<text x="662.0" y="200" font-size="13" fill="#6a4a36" text-anchor="middle">every weight read once per token (~242 MB); 16 of the chip's 39 DSP blocks in use</text>
+<text x="662.0" y="200" font-size="13" fill="#6a4a36" text-anchor="middle">every weight read once per token (~229 MB); 16 of the chip's 39 DSP blocks in use</text>
 <text x="392" y="234" font-size="14" fill="#1b1f27" text-anchor="start" font-weight="700">Input X: 16 block-RAM banks, 64 int8 values read per cycle</text>
 <rect x="392.0" y="244" width="31" height="30" rx="3" fill="#ffffff" stroke="#2f5c8a" stroke-width="1.2"/>
 <text x="407.5" y="264" font-size="11" fill="#2f5c8a" text-anchor="middle">0</text>
@@ -208,7 +208,7 @@
 <text x="662.0" y="894" font-size="14" fill="#1b1f27" text-anchor="middle" font-weight="700">the CPU's RAM, second port: DMA unit, packer, copy-out</text>
 <text x="662.0" y="916" font-size="13" fill="#4a5262" text-anchor="middle">main memory ⇄ RAM · int32 → MX into X · results → RAM</text>
 <rect x="990" y="100" width="390" height="870" rx="14" fill="#eef7f0" stroke="#93c2a0" stroke-width="1.5"/>
-<text x="1010" y="128" font-size="15" fill="#2e6b40" text-anchor="start" font-weight="700">CPU CLOCK DOMAIN · 49 MHz</text>
+<text x="1010" y="128" font-size="15" fill="#2e6b40" text-anchor="start" font-weight="700">CPU CLOCK DOMAIN · 54 MHz</text>
 <rect x="1010" y="150" width="350" height="170" rx="10" fill="#fff" stroke="#2e6b40" stroke-width="2"/>
 <text x="1185" y="180" font-size="18" fill="#1b1f27" text-anchor="middle" font-weight="700">zeitlos32ps · RV32IM</text>
 <text x="1030" y="208" font-size="13" fill="#4a5262" text-anchor="start">firmware in 96 KB block RAM, integer only:</text>

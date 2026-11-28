@@ -60,15 +60,27 @@ module mlm_uart #(
 	reg [3:0] rbits;
 	reg [15:0] rcnt;
 	reg [7:0] rsh;
-	reg [7:0] q [0:15];
-	reg [4:0] qw, qr;
+	// the receive FIFO: 2048 bytes in one block RAM, so that a pasted
+	// line survives while the firmware is busy for a model layer (it
+	// reads the console between layers). The RAM's output is registered
+	// (qd): after a pop, or a byte into the empty FIFO, the FIFO reads
+	// as empty for two cycles while qd catches up.
+	reg [7:0] q [0:2047];
+	reg [7:0] qd;
+	reg [11:0] qw, qr;
+	reg [1:0] qhold;
 	reg ovr;
 	wire q_empty = (qw == qr);
-	wire q_full = (qw - qr) == 5'd16;
+	wire q_full = (qw - qr) == 12'd2048;
+	reg q_put;
+	// q_put: the FIFO was not empty last cycle either, so a byte just
+	// written into an empty FIFO is not offered before qhold covers it
+	wire q_avail = !q_empty && q_put && qhold == 2'd0;
+	always @(posedge clk) qd <= q[qr[10:0]];
 	reg pop;
 	always @(posedge clk) begin
 		if (rst) begin
-			rbits <= 4'd0; qw <= 5'd0; ovr <= 1'b0;
+			rbits <= 4'd0; qw <= 12'd0; ovr <= 1'b0;
 		end else begin
 			if (rbits == 4'd0) begin
 				if (!rxs) begin rbits <= 4'd10; rcnt <= {1'b0, div[15:1]}; end
@@ -80,7 +92,7 @@ module mlm_uart #(
 				end else if (rbits == 4'd1) begin
 					if (rxs) begin
 						if (q_full) ovr <= 1'b1;
-						else begin q[qw[3:0]] <= rsh; qw <= qw + 5'd1; end
+						else begin q[qw[10:0]] <= rsh; qw <= qw + 12'd1; end
 					end
 				end else
 					rsh <= {rxs, rsh[7:1]};
@@ -91,9 +103,13 @@ module mlm_uart #(
 	always @(posedge clk) begin
 		bus_ack <= 1'b0;
 		pop <= 1'b0;
+		q_put <= !q_empty;
+		if (rst) qhold <= 2'd2;
+		else if (!q_empty && !q_put) qhold <= 2'd2;      // the first byte into an empty FIFO
+		else if (qhold != 2'd0) qhold <= qhold - 2'd1;
 		if (rst) begin
 			div <= DIV_RESET;
-			qr <= 5'd0;
+			qr <= 12'd0;
 		end else if (bus_req && !bus_ack) begin
 			if (bus_adr == 2'd0 && bus_we && !tx_ready) begin
 				// wait until the transmitter takes it
@@ -102,10 +118,10 @@ module mlm_uart #(
 				bus_rdat <= 32'd0;
 				case (bus_adr)
 				2'd0: if (!bus_we) begin
-					if (q_empty) bus_rdat <= 32'h100;
-					else begin bus_rdat <= {24'd0, q[qr[3:0]]}; qr <= qr + 5'd1; end
+					if (!q_avail) bus_rdat <= 32'h100;
+					else begin bus_rdat <= {24'd0, qd}; qr <= qr + 12'd1; qhold <= 2'd2; end
 				end
-				2'd1: bus_rdat <= {29'd0, ovr, !q_empty, tx_ready};
+				2'd1: bus_rdat <= {29'd0, ovr, q_avail, tx_ready};
 				2'd2: if (bus_we) div <= bus_wdat[15:0]; else bus_rdat <= {16'd0, div};
 				default: ;
 				endcase

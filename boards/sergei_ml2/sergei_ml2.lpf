@@ -135,3 +135,9 @@ LOCATE COMP "usb_host_dp" SITE "A5";
 IOBUF PORT "usb_host_dp" IO_TYPE=LVCMOS33 PULLMODE=NONE;
 LOCATE COMP "usb_host_dm" SITE "A6";
 IOBUF PORT "usb_host_dm" IO_TYPE=LVCMOS33 PULLMODE=NONE;
+
+# PROGRAMN, routed back to a user pin on the ML2 module (as Zeitlos's
+# boards/sergei_ml2.lpf): pulled low, open drain, to reload the FPGA
+# from flash address 0 (machboot); released otherwise
+LOCATE COMP "PROGRAMN" SITE "M8";
+IOBUF PORT "PROGRAMN" IO_TYPE=LVCMOS33 OPENDRAIN=ON;

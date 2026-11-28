@@ -50,6 +50,11 @@ void plat_mem_wblk(uint32_t off, const void *src, uint32_t nblk);
 void plat_mem_wcol(uint32_t off, const void *src, uint32_t n, uint32_t stride);
 void plat_dma_wait(void);
 
+/* Called before each layer (every few tens of ms on the board): the
+ * firmware watches the keyboard there, so a short Esc press between two
+ * tokens is not missed. Nothing elsewhere. */
+void plat_poll(void);
+
 /* rows x DOT(row, x) for rows of a 1-bit matrix at mem offset addr,
  * rows row_stride bytes apart, `groups` groups of 128 (eng_dot_spec in
  * eng_spec.h; qbits is 1). Blocks until done. rows <= ENG_OUT_MAX. */
@@ -92,7 +97,7 @@ void plat_putc(int c);
 
 /* Profiling: the model code marks where it is; the platform may count
  * time per section (MLM_PROF_*). Defined empty when not wanted. */
-#ifdef MLM_PROFILE
+#if defined(MLM_PROFILE) || defined(MLM_PROF_HOOK)
 void plat_prof(int section);
 int plat_prof_cur(void);
 #else

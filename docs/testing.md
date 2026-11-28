@@ -18,8 +18,37 @@ want the RAM's second port or the memory stream at the same time (the
 firmware never lets them).
 
 `make -C sim/soc test-2c` is the same with two clock domains (CPU 50 MHz,
-memory side 75 MHz, as `make MEM_MHZ=75`); `make -C sim/mem test-fast`
-runs the controller and DRAM model at 64, 75 and 100 MHz.
+memory side 75 MHz, as `make MEM_MHZ=75`); `make -C sim/soc test-board`
+with the boards' clocks (CPU 54 MHz, memory side 90 MHz); `make -C
+sim/mem test-fast` runs the controller and DRAM model at 64, 75 and 100
+MHz. `TB_SD_DIV=0x81 make -C sim/sd test` loads through the SD host with
+a three-cycle SD clock period (the boards' 18 MHz).
+
+Type-ahead: `TB_TYPE_GAP=N` makes the testbench type the question with N
+cycles between characters (`~` in it is a backspace), so the firmware
+reads it ahead while it is typed; `TB_TYPE_PAUSE=N` adds a pause of N
+cycles before Enter and at each `|` in the question (not typed), where
+the firmware reads the rest of the line and the template's end ahead.
+With `TB_CMD=":temp 0"` the answer must be byte-identical to the one
+typed at full speed:
+
+```
+cd sim/soc && export TB_CMD=":temp 0"
+obj_2c/Vmlm_soc @../../build/models/b1l.mlm "Tell me about dogs and cats please." 3000000000 12
+TB_TYPE_GAP=1500000 obj_2c/Vmlm_soc @../../build/models/b1l.mlm "Tell me about birds and~~~~~~~~~dogs and cats please." 3000000000 12
+TB_TYPE_GAP=1500000 TB_TYPE_PAUSE=40000000 obj_2c/Vmlm_soc @../../build/models/b1l.mlm "Tell me about birds|~~~~~dogs and c|ats please." 5000000000 12
+```
+
+(b1l: 54 prompt tokens in 1.00 s after Enter typed at once, 0.40 s typed
+with gaps, 0.02 s with the pauses; the same 12 tokens each time.) `:v`
+also prints the stack's high-water mark.
+
+The stack is what the 96 KB block RAM leaves after code and variables:
+about 2.4 KB in the board firmware (profiler off, the console's code
+compiled for size), more in the simulation builds. Bonsai with typing
+during read-ahead peaks at 984 bytes in `make -C sim/soc test-board`'s
+firmware (`TB_CMD2=":v"`) and 1,060 on the board. If it ever comes within 256 bytes of the
+variables, the prompt says so.
 
 `sim/soc` also takes `@model.mlm` instead of a card image: the model is
 put in memory directly (no card). The whole Bonsai model runs that way

@@ -32,6 +32,8 @@ void plat_mem_rd(void *, uint32_t, uint32_t) {}
 void plat_mem_wblk(uint32_t, const void *, uint32_t) {}
 void plat_mem_wcol(uint32_t, const void *, uint32_t, uint32_t) {}
 void plat_dma_wait(void) {}
+void plat_poll(void) {}
+
 void plat_putc(int) {}
 }
 

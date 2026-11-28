@@ -107,7 +107,7 @@ static int vs_emax;
 /* per cache row (layer x KV head), the largest V-scale exponent of the
  * positions stored so far (kept as they are stored; attend() needs it
  * and would otherwise scan them all) */
-#define VEM_ROWS 512
+#define VEM_ROWS 256
 static int16_t VEM[VEM_ROWS];
 
 static int eqh[MLM_MAX_HEADS], ekh[MLM_MAX_HEADS], eoh[MLM_MAX_HEADS];
@@ -329,14 +329,6 @@ static void dot_start(mlm_ctx_t *m, const mlm_tensor_t *t, uint32_t n, int bank)
 	m->dot_rows += n;
 }
 
-static void dot_raw(mlm_ctx_t *m, uint32_t addr, uint32_t stride, uint32_t rows,
-                    uint32_t groups)
-{
-	plat_eng_dot(addr, stride, rows, groups, 8);
-	m->n_dot++;
-	m->dot_rows += rows;
-}
-
 /* engine results -> int32 vector; returns its exponent */
 static int out_to_i32(int32_t *dst, int n, int eacc)
 {
@@ -509,8 +501,10 @@ static void kv_store_all(mlm_ctx_t *m, int l, const int32_t *k, const int *ek, c
 {
 	const mlm_header_t *hd = m->hdr;
 	int n = hd->head_dim, hp = m->hd_pad, nkv = hd->n_kv_heads;
-	uint32_t ks[MLM_MAX_HEADS], vs[MLM_MAX_HEADS];
-	uint32_t qw[64];                    /* word aligned for v_kvq8 */
+	/* in ATT, free until attention (not on the stack: the firmware's
+	 * stack is short, and a step runs under the line editor) */
+	uint32_t *ks = (uint32_t *)ATT, *vs = ks + MLM_MAX_HEADS;
+	uint32_t *qw = vs + MLM_MAX_HEADS;  /* 64 words, aligned for v_kvq8 */
 	int8_t *q = (int8_t *)qw;
 	uint32_t col = (m->pos / 128) * 136 + 8 + (m->pos % 128);
 	for (int i = 0; i < nkv; i++) {
@@ -672,6 +666,28 @@ static int embed(mlm_ctx_t *m, uint32_t tok, int32_t *dst)
 
 /* ---------------------------------------------------------------- */
 
+void mlm_rewind(mlm_ctx_t *m, uint32_t pos)
+{
+	const mlm_header_t *hd = m->hdr;
+	if (pos >= m->pos) return;
+	m->pos = pos;
+	ks_row = ~0u;
+	h_max_ok = 0;
+	/* the cache rows beyond pos are stale but never read (and written
+	 * again as positions are stored); each row's largest V exponent is
+	 * over the positions that remain */
+	uint32_t rows = hd->n_layers * hd->n_kv_heads;
+	for (uint32_t row = 0; pos && row < rows && row < VEM_ROWS; row++) {
+		plat_mem_rd(VS, m->vscale + row * m->ctx * 4, pos);
+		int vemax = -32768;
+		for (uint32_t t = 0; t < pos; t++) {
+			int ve = (int16_t)(VS[t] >> 16);
+			if (ve > vemax) vemax = ve;
+		}
+		VEM[row] = (int16_t)vemax;
+	}
+}
+
 int mlm_init(mlm_ctx_t *m, uint32_t ctx)
 {
 	/* the header in block RAM: it is read all through each step, and
@@ -744,6 +760,7 @@ int mlm_step_ex(mlm_ctx_t *m, uint32_t token, int logits)
 	int32_t *q = S, *k = S + qd, *v = S + qd + kvd;
 
 	for (uint32_t l = 0; l < hd->n_layers; l++) {
+		plat_poll();
 		/* the descriptor in block RAM: main memory is the engine's
 		 * while it streams */
 		mlm_layer_t Lc;
@@ -1056,7 +1073,7 @@ int mlm_encode(mlm_ctx_t *m, const char *text, uint32_t *out, int max)
 	tok_open(m, &t);
 	int bpe = (m->hdr->flags & MLM_F_TOK_BPE) != 0;
 	int n = 0;
-	static uint8_t buf[1024];
+	static uint8_t buf[256];             /* two tokens joined (none is longer) */
 	if (!bpe && text[0] && n < max) {
 		int id = tok_lookup(&t, (const uint8_t *)" ", 1);
 		if (id >= 0) out[n++] = (uint32_t)id;

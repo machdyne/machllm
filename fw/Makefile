@@ -5,10 +5,13 @@ BUILD ?= $(shell git -C .. describe --always --dirty 2>/dev/null || echo dev)
 CFLAGS = -march=rv32im -mabi=ilp32 -O2 -flto -ffreestanding -fno-builtin-printf -nostdlib \
          -Wall -Wextra -Wno-unused-parameter -I. -Icommon \
          -DMLM_MAX_DIM=2048 -DMLM_MAX_SCRATCH=4096 -DMLM_MAX_HEADS=32 -DMLM_MAX_CTX=512 \
-         -DMLM_BUILD_STR='"$(BUILD)"' -DMLM_PROFILE -DSYS_MHZ=$(SYS_MHZ) -DMEM_MHZ=$(MEM_MHZ) $(CFLAGS_EXTRA)
+         -DMLM_BUILD_STR='"$(BUILD)"' $(if $(filter 1,$(PROFILE)),-DMLM_PROFILE) -DMLM_PROF_HOOK -DSYS_MHZ=$(SYS_MHZ) -DMEM_MHZ=$(MEM_MHZ) $(CFLAGS_EXTRA)
 SRC = crt0.S main.c ui.c libc.c common/mlm_model.c common/sd.c
 OUT ?= ../build/sergei_ml2
 SYS_MHZ ?= 48
+# PROFILE=1: :v splits each token by section (the simulations' default;
+# boards leave it out for the stack's sake: make PROFILE=1 fw fwbit)
+PROFILE ?= 1
 MEM_MHZ ?= $(SYS_MHZ)
 
 all: $(OUT)/fw.hex

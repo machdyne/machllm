@@ -10,10 +10,15 @@
 
 BOARD ?= sergei_ml2
 # placement seed and placer options. With the screen (UI=1): MEM_MHZ=75
-# meets timing with seed 3; MEM_MHZ=90 with seed 6 and a stronger timing
-# weight (memory side 92.5 MHz, CPU 52.7; seeds 2-5 reach 59-89 MHz).
+# meets timing with seed 3; MEM_MHZ=90 with seed 3 and a stronger timing
+# weight: Sergei ML2 memory side 93.0 MHz, CPU 57.6 (54 needed); Mozart
+# ML2 91.9 and 56.2 (its earlier seed 6 now reaches 88.1, seed 7 misses
+# the CPU's 54).
 # Results depend on the nextpnr version (these: yowasp-nextpnr-ecp5).
-SEED ?= $(if $(filter 90,$(MEM_MHZ)),6,3)
+SEED ?= 3
+# the firmware's per-section profiler (:v); off on boards: its RAM is the
+# stack's (make PROFILE=1 fw fwbit for a firmware with it)
+PROFILE ?= 0
 PNR_OPTS ?= $(if $(filter 90,$(MEM_MHZ)),--placer-heap-timingweight 30 --placer-heap-critexp 4,)
 # memory-side clock in MHz; the DDR3 clock is twice this. 48 is
 # Zeitlos's (DDR3 at 96), one clock domain. 75 or 100 (DDR3 at 150 or
@@ -21,7 +26,7 @@ PNR_OPTS ?= $(if $(filter 90,$(MEM_MHZ)),--placer-heap-timingweight 30 --placer-
 MEM_MHZ ?= 48
 # the CPU's clock: 48 in the one-domain build, else the PLL's CLKOS2
 # (50; 49.09 with DDR3 at 180, whose VCO is 540)
-SYS_MHZ = $(if $(filter 48,$(MEM_MHZ)),48,$(if $(filter 90,$(MEM_MHZ)),49,50))
+SYS_MHZ = $(if $(filter 48,$(MEM_MHZ)),48,$(if $(filter 90,$(MEM_MHZ)),54,50))
 # the screen (DVI, 80 x 25 text) and USB keyboard: on by default; they
 # need the two-domain builds (MEM_MHZ 75 or 90), and UI=0 leaves them
 # out (one block RAM and ~1,500 LUTs less). The firmware finds out at
@@ -33,15 +38,25 @@ ECPPACK ?= ecppack
 OUT = build/$(BOARD)$(if $(filter 48,$(MEM_MHZ)),,_mem$(MEM_MHZ))
 Z = ext/zeitlos/rtl
 
+# The ML2 module on either motherboard: the same pins but for the
+# microSD card's DAT1/DAT2, which only Sergei wires (Mozart: a 1-bit
+# bus, so loading takes about four times as long). One top for both.
+TOP = boards/sergei_ml2/top.v
+SD_1BIT = 0
 ifeq ($(BOARD),sergei_ml2)
 DEVICE = 45k
 PACKAGE = CABGA256
 else ifeq ($(BOARD),mozart_ml2)
-$(error mozart_ml2: pin file not written yet (SD D1/D2 balls needed))
+DEVICE = 45k
+PACKAGE = CABGA256
+SD_1BIT = 1
+else
+$(error BOARD: sergei_ml2 or mozart_ml2)
 endif
+FW_CFLAGS = $(if $(filter 1,$(SD_1BIT)),-DSD_1BIT,)
 
 RTL_INC = rtl/mlm_sigtab.vh rtl/mlm_exp2tab.vh
-RTL = boards/$(BOARD)/top.v rtl/mlm_soc.v rtl/mlm_dma.v rtl/mlm_vu.v rtl/mlm_engine.v rtl/mlm_mul16r.v rtl/mlm_mul18s.v rtl/mlm_uart.v rtl/sd/mlm_sd.v \
+RTL = $(TOP) rtl/mlm_soc.v rtl/mlm_dma.v rtl/mlm_vu.v rtl/mlm_engine.v rtl/mlm_mul16r.v rtl/mlm_mul18s.v rtl/mlm_uart.v rtl/sd/mlm_sd.v \
       rtl/mem/mlm_ddr3.v rtl/mem/mlm_ddr3_ctrl.v \
       $(Z)/mem/ddr3_phy_ecp5.v rtl/mem/mlm_ddr3_rdasm.v rtl/mem/mlm_ddr3_clk.v rtl/mem/mlm_pll.v $(Z)/mem/ddr3_phy_init.v \
       $(Z)/clk/pll2.v $(Z)/cpu/zeitlos32ps/zeitlos32ps.v $(Z)/cpu/zeitlos32ps/zeitlos32ps_alu.v \
@@ -53,10 +68,10 @@ RTL_INC += rtl/mlm_font8x16.hex
 all: $(OUT)/machllm.bit
 
 fw:
-	$(MAKE) -C fw OUT=../$(OUT) SYS_MHZ=$(SYS_MHZ) MEM_MHZ=$(MEM_MHZ)
+	$(MAKE) -C fw OUT=../$(OUT) SYS_MHZ=$(SYS_MHZ) MEM_MHZ=$(MEM_MHZ) PROFILE=$(PROFILE) CFLAGS_EXTRA="$(FW_CFLAGS)"
 
 $(OUT)/fw.hex: fw/*.c fw/*.h fw/*.S fw/common/*.c fw/common/*.h
-	$(MAKE) -C fw OUT=../$(OUT) SYS_MHZ=$(SYS_MHZ) MEM_MHZ=$(MEM_MHZ)
+	$(MAKE) -C fw OUT=../$(OUT) SYS_MHZ=$(SYS_MHZ) MEM_MHZ=$(MEM_MHZ) PROFILE=$(PROFILE) CFLAGS_EXTRA="$(FW_CFLAGS)"
 
 # The block RAM is synthesised with random contents (ecpbram), which
 # the firmware replaces in the placed design: a new firmware then needs
@@ -77,6 +92,7 @@ $(OUT)/fw_pad.hex: $(OUT)/fw.hex
 $(OUT)/cfg.vh: Makefile
 	mkdir -p $(OUT)
 	printf '`define SYS_MHZ %s\n`define MEM_MHZ %s\n`define FW_HEX "%s"\n`define UI %s\n' $(SYS_MHZ) $(MEM_MHZ) $(OUT)/fw_rand.hex $(UI) > $@
+	$(if $(filter 1,$(SD_1BIT)),printf '`define SD_1BIT\n' >> $@,)
 
 # The design goes through RTLIL before synth_ecp5 (as Zeitlos does for
 # DDR3 boards): the PHY's parameterised DQSBUFM blackboxes otherwise make

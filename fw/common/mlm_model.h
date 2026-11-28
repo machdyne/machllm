@@ -57,6 +57,10 @@ typedef struct {
 
 /* 0 on success; sets up the caches after the image in memory. */
 int mlm_init(mlm_ctx_t *m, uint32_t ctx);
+/* Back to position pos (< m->pos): the tokens from there on are
+ * forgotten, and the steps that follow give exactly what they would
+ * have given had those tokens never been read. */
+void mlm_rewind(mlm_ctx_t *m, uint32_t pos);
 
 /* Run one token at position m->pos; fills the top-k; pos++.
  * Returns 0, or -1 when the context is full. */
@@ -100,6 +104,12 @@ uint32_t mlm_sample(mlm_ctx_t *m);
 
 /* Tokenizer. Returns the number of tokens written (<= max). */
 int mlm_encode(mlm_ctx_t *m, const char *text, uint32_t *out, int max);
+
+/* Thinking mode: Bonsai 1.7B closes an opened <think> at once by itself;
+ * these first words of the reasoning get it to reason (fw/main.c,
+ * ref/mlm_run.c -think) */
+#define MLM_THINK_PREFIX "Okay, let me think about this carefully."
+
 /* The bytes of a token; *len set. prev is the previous token (for the
  * SentencePiece leading-space rule). */
 const uint8_t *mlm_decode(mlm_ctx_t *m, uint32_t prev, uint32_t tok, uint32_t *len);

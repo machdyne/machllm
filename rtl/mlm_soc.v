@@ -8,7 +8,10 @@
  *
  *   0x0000_0000  RAM      BRAM_KB of block RAM: firmware, stack, buffers
  *   0x4000_0000  MAIN     512 MB DDR3 (mlm_ddr3: model image, KV cache)
- *   0x7000_0000  SYSCTL   0 LED, 4 ID "MLLM", 8 BUILD (parameter)
+ *   0x7000_0000  SYSCTL   0 LED, 4 ID "MLLM", 8 BUILD (parameter), 12 LINE,
+ *                         16 RECONFIG: the key 0x5A52_4254 ("ZRBT") pulls
+ *                         PROGRAMN low, the FPGA reloads (from flash 0:
+ *                         machboot); reads 0x5A52_0001
  *   0x7600_0000  UI       the screen and the keyboard (UI = 1; rtl/mlm_ui.v)
  *   0x7000_0700  DDR3     Zeitlos's DDR3 registers (status, tune, ctrl)
  *   0x7100_0000  UART
@@ -81,6 +84,7 @@ module mlm_soc #(
 	input wire [3:0] sd_dat_i,
 
 	output reg led,
+	output reg reconfig,              // 1: pull PROGRAMN low (never out of reset)
 
 	// UI = 1 only
 	input wire pclk,
@@ -382,14 +386,16 @@ module mlm_soc #(
 
 	always @(posedge clk) begin
 		sys_ack <= 1'b0;
-		if (rst) begin led <= 1'b0; ln_en <= 1'b0; end
+		if (rst) begin led <= 1'b0; ln_en <= 1'b0; reconfig <= 1'b0; end
 		else if (pend && pt == 3'd6 && !sys_ack) begin
 			sys_ack <= 1'b1;
-			case (p_adr[3:2])
-			2'd0: begin if (p_we) led <= p_wdat[0]; sys_rdat <= {31'd0, led}; end
-			2'd1: sys_rdat <= 32'h4d4c4c4d;
-			2'd2: sys_rdat <= BUILD;
-			default: begin if (p_we) ln_en <= p_wdat[0]; sys_rdat <= {31'd0, ln_en}; end
+			case (p_adr[4:2])
+			3'd0: begin if (p_we) led <= p_wdat[0]; sys_rdat <= {31'd0, led}; end
+			3'd1: sys_rdat <= 32'h4d4c4c4d;
+			3'd2: sys_rdat <= BUILD;
+			3'd3: begin if (p_we) ln_en <= p_wdat[0]; sys_rdat <= {31'd0, ln_en}; end
+			3'd4: begin if (p_we && p_wdat == 32'h5a524254) reconfig <= 1'b1; sys_rdat <= 32'h5a520001; end
+			default: sys_rdat <= 32'd0;
 			endcase
 		end
 	end

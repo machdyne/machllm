@@ -82,9 +82,13 @@ int sd_init(sd_t *s, uint32_t fast_div)
 	if (cmd(3, 0, RSP_48, &r)) return -14;
 	s->rca = r >> 16;
 	if (cmd(7, s->rca << 16, RSP_48 | RSP_BUSY, 0)) return -15;
+#ifndef SD_1BIT
 	if (cmd(55, s->rca << 16, RSP_48, 0)) return -16;
 	if (cmd(6, 2, RSP_48, 0)) return -17;    /* 4-bit bus */
 	s->wide = 1;
+#else
+	s->wide = 0;                             /* only DAT0 is wired (Mozart ML2) */
+#endif
 	if (!s->ccs && cmd(16, 512, RSP_48, 0)) return -18;
 	plat_sd_wr(R_DIV, fast_div);
 	s->div = fast_div;
@@ -309,7 +313,8 @@ int32_t fat_load(fat_t *f, uint32_t clus, uint32_t size, uint32_t mem_addr,
 					 * at 48): commands the card rejects with a CRC error
 					 * at speed mean the line can't carry it */
 					fat_reinits++;
-					if (f->sd->div < 3) f->sd->div++;
+					if (f->sd->div & 0x80) f->sd->div &= 0x7f;   /* 3 cycles -> 4 */
+					else if (f->sd->div < 3) f->sd->div++;
 					idle_clocks(80);
 					if (sd_init(f->sd, f->sd->div)) { idle_clocks(800); (void)sd_init(f->sd, f->sd->div); }
 				}

@@ -141,11 +141,15 @@ module mlm_sd #(
 		end else if (sd_sck) begin
 			sd_sck <= 1'b0;
 			fall <= 1'b1;
-			divc <= r_div;
+			divc <= {1'b0, r_div[6:0]};
 		end else if (need_clk) begin
 			sd_sck <= 1'b1;
 			rise <= 1'b1;
-			divc <= r_div;
+			// r_div[7]: the high half one cycle shorter, for an odd
+			// period (3 cycles: 20 MHz from 60). The low half stays
+			// long: the card's output settles in it, and the host's
+			// CMD changes after the falling edge
+			divc <= {1'b0, r_div[6:0]} - {7'd0, r_div[7]};
 		end
 	end
 

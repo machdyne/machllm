@@ -30,14 +30,19 @@
 module top (
 	input wire CLK_48,
 	output wire LED_B,
+	// the FPGA's PROGRAMN, routed back to a user pin (M8): pulled low,
+	// open drain, it reloads the FPGA from flash address 0 (machboot)
+	inout wire PROGRAMN,
 	output wire UART0_TX,
 	input wire UART0_RX,
 
 	output wire SD_SCK,
 	inout wire SD_MOSI,              // CMD
 	input wire SD_MISO,              // DAT0
-	input wire SD_D1,
+`ifndef SD_1BIT
+	input wire SD_D1,                // (Sergei only: Mozart's card has a 1-bit bus)
 	input wire SD_D2,
+`endif
 	input wire SD_SS,                // DAT3 (only read: never driven)
 
 	output wire [15:0] ddr3_a,
@@ -108,6 +113,9 @@ module top (
 	wire cmd_o, cmd_oe;
 	assign SD_MOSI = cmd_oe ? cmd_o : 1'bz;
 
+	wire reconfig;
+	BB programn_bb (.I(1'b0), .T(~reconfig), .O(), .B(PROGRAMN));
+
 	mlm_soc #(.INIT_FILE(`FW_HEX), .SYS_MHZ(`SYS_MHZ), .TWO_CLK(TWO_CLK), .MEM_MHZ(`MEM_MHZ), .UI(UI)) soc (
 		.clk(clk), .rst(rst), .mclk(mclk), .mrst(mrst),
 		.eclk(eclk), .ddrdel(ddrdel), .pause(pause), .phy_rst(phy_rst),
@@ -118,8 +126,13 @@ module top (
 		.ddr3_dqs_p(ddr3_dqs_p), .ddr3_clk_p(ddr3_clk_p),
 		.uart_tx(UART0_TX), .uart_rx(UART0_RX),
 		.sd_sck(SD_SCK), .sd_cmd_o(cmd_o), .sd_cmd_oe(cmd_oe), .sd_cmd_i(SD_MOSI),
+`ifdef SD_1BIT
+		.sd_dat_i({SD_SS, 1'b1, 1'b1, SD_MISO}),
+`else
 		.sd_dat_i({SD_SS, SD_D2, SD_D1, SD_MISO}),
+`endif
 		.led(LED_B),
+		.reconfig(reconfig),
 		.pclk(pclk), .bclk(bclk), .clk12(clk12),
 		.tmds_clk(t_c), .tmds_r(t_r), .tmds_g(t_g), .tmds_b(t_b),
 		.usb_dp(usb_host_dp), .usb_dm(usb_host_dm)

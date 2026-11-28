@@ -48,25 +48,88 @@ static int getc_(void)
 	return (int)(d & 0xff);
 }
 /* a line from the serial console or the keyboard (fw/ui.c), whichever
- * types; shown on both. Returns its length, or -1 for F1 (a new
- * conversation). Esc on the keyboard clears the line. */
-static int readline(char *b, int max)
+ * types; shown on both. Returns its length, -1 for F1 (a new
+ * conversation) or -2 for F10 (exit); F2 turns thinking on or off. Esc
+ * on the keyboard clears the line. */
+/* randomness for sampling: the cycle counter at each key typed (the
+ * person's timing, a few unpredictable bits a key), stirred into the
+ * sampler's state when an answer starts; the boot-time seed alone
+ * repeats from one power-up to the next */
+static uint64_t cycles(void);
+static uint32_t entropy;
+static void stir(void) { entropy = (entropy ^ (uint32_t)cycles()) * 0x9e3779b1u; entropy ^= entropy >> 15; }
+/* The line editor is a state the keys are fed into (ed_poll), so that
+ * it also runs while the model reads the question ahead (prefill): the
+ * model's code calls plat_poll between layers and the engine's wait
+ * loop polls too, so a key is echoed within a millisecond or so. */
+static struct { char *b; int max, n, done, on; } ed;   /* done: 1 Enter, -1 F1, -2 F10 */
+static uint32_t ed_ver;                 /* changes with the text */
+static uint64_t ed_t;                   /* the last key's time */
+static void toggle_think(void);
+static void ed_key(int c, int kb)
 {
-	int n = 0;
-	ui_input(b, 0, 1);
-	for (;;) {
-		int c = -1, kb = 0;
+	char *b = ed.b;
+	stir();
+	ed_t = cycles();
+	ed_ver++;
+	if (c == UI_F1) ed.done = -1;
+	else if (c == UI_F10) ed.done = -2;
+	else if (c == UI_F2) toggle_think();
+	else if (c == 27 && kb) { while (ed.n) { ed.n--; puts_("\b \b"); } ui_input(b, 0, 1); }
+	else if (c == '\r' || c == '\n') { puts_("\n"); b[ed.n] = 0; ed.done = 1; }
+	else if ((c == 8 || c == 127) && ed.n) { ed.n--; puts_("\b \b"); ui_input(b, ed.n, 1); }
+	else if (c >= 32 && c < 127 && ed.n < ed.max - 1) { b[ed.n++] = (char)c; plat_putc(c); ui_input(b, ed.n, 1); }
+}
+static void ed_poll(void)
+{
+	while (!ed.done) {
+		int c, kb = 0;
 		uint32_t d = UART_DATA;
 		if (!(d & 0x100)) c = (int)(d & 0xff);
 		else if ((c = ui_key()) >= 0) kb = 1;
-		if (c < 0) continue;
-		if (c == UI_F1) { b[0] = 0; ui_input(b, 0, 0); return -1; }
-		if (c == 27 && kb) { while (n) { n--; puts_("\b \b"); } ui_input(b, 0, 1); continue; }
-		if (c == '\r' || c == '\n') { puts_("\n"); b[n] = 0; ui_input(b, 0, 0); return n; }
-		if ((c == 8 || c == 127) && n) { n--; puts_("\b \b"); ui_input(b, n, 1); continue; }
-		if (c >= 32 && c < 127 && n < max - 1) { b[n++] = (char)c; plat_putc(c); ui_input(b, n, 1); }
+		else break;
+		ed_key(c, kb);
 	}
 }
+static void prefill(void);
+static int chat_prompt(const char *line, uint32_t *t, int max);
+static uint32_t stack_free(void);
+static uint32_t stack_size(void);
+static int readline(char *b, int max)
+{
+	ed.b = b; ed.max = max; ed.n = 0; ed.done = 0;
+	ui_input(b, 0, 1);
+	ed.on = 1;
+	while (!ed.done) {
+		ed_poll();
+		if (!ed.done) prefill();
+	}
+	ed.on = 0;
+	if (ed.done == 1) { ui_input(b, 0, 0); return ed.n; }
+	b[0] = 0;
+	ui_input(b, 0, 0);
+	return ed.done;
+}
+/* back to machboot: PROGRAMN low (rtl/mlm_soc.v); the FPGA reloads
+ * from flash address 0, machboot's bitstream */
+static void to_machboot(void)
+{
+	if ((SYS_RECONFIG >> 16) != 0x5a52) { puts_("(not in this bitstream)\n"); return; }
+	puts_("returning to machboot\n");
+	ui_status("Returning to machboot...");
+	for (volatile int k = 0; k < 200000; k++) ;      /* the UART drains */
+	SYS_RECONFIG = RECONFIG_KEY;
+	for (;;) ;
+}
+
+/* Esc pressed while the model runs (plat_poll, between layers) */
+static int watch_esc, esc_seen;
+void plat_poll(void)
+{
+	if (ed.on) ed_poll();
+	else if (watch_esc && !esc_seen && ui_key() == 27) esc_seen = 1;
+}
+
 static uint64_t cycles(void)
 {
 	uint32_t hi, lo, hi2;
@@ -109,7 +172,7 @@ void plat_eng_start(uint32_t addr, uint32_t stride, uint32_t rows, uint32_t grou
 
 void plat_eng_wait(void)
 {
-	while (ENG_CTRL & 1) ;
+	while (ENG_CTRL & 1) if (ed.on) ed_poll();
 	eng_running = 0;
 	/* the engine counts its own (memory-side) cycles; ENG_CPU() turns
 	 * them into CPU cycles where they are reported (a 64-bit division
@@ -244,6 +307,14 @@ void plat_prof(int sec)
 	BBOX->sec = (uint32_t)sec; BBOX->ticks++;
 }
 int plat_prof_cur(void) { return prof_cur; }
+#else
+/* without the profiler (the board's default: its tables and report cost
+ * the stack 1.4 KB of RAM): only the black box's section */
+static int prof_cur = -1;
+void plat_prof(int sec) { prof_cur = sec; BBOX->sec = (uint32_t)sec; BBOX->ticks++; }
+int plat_prof_cur(void) { return prof_cur; }
+#endif
+#ifdef MLM_PROFILE
 COLD static void prof_report(void)
 {
 	static const char *nm[MLM_PROF_N] = { "norm", "qkv", "qknorm+rope", "kv store", "attention",
@@ -348,6 +419,12 @@ void plat_mem_wcol(uint32_t off, const void *src, uint32_t n, uint32_t stride)
 
 uint32_t plat_sd_rd(int reg) { return ((volatile uint32_t *)SD_BASE)[reg]; }
 void plat_sd_wr(int reg, uint32_t v) { ((volatile uint32_t *)SD_BASE)[reg] = v; }
+
+/* From here on: setup, tests, loading, the console and the commands, at
+ * most once a token or a key. Compiled for size: all of the firmware
+ * shares the 96 KB block RAM with the stack (the engine and memory
+ * glue above, run per element and per row, stays at -O2). */
+#pragma GCC optimize ("Os")
 
 /* ---------------------------------------------------------------- */
 /* DDR3 read-path training: Zeitlos's sw/bios/bios.c (b62a74bf),    */
@@ -710,7 +787,7 @@ static int list_cb(void *ctx, const char *n, uint32_t c, uint32_t sz)
 static mlm_ctx_t M;
 static int model_ok;
 static uint32_t ctx_len = 512;
-static uint32_t sd_div = SD_FAST_DIV;   /* :sdclk N: SCK = SYS_MHZ / (2 (N + 1)) */
+static uint32_t sd_div = SD_FAST_DIV;   /* :sdclk N: SCK = SYS_MHZ / SD_PERIOD(N) */
 
 /* loading progress, on one line: MB so far, of MB, percent */
 static uint32_t prog_last;
@@ -737,7 +814,7 @@ COLD static int load_model(int k)
 		((volatile uint32_t *)plat_mem())[0] = 0;
 		puts_("\nload failed: sd error "); put_dec((uint32_t)-rc);
 		puts_(" at card sector "); put_dec(fat_fail_lba);
-		puts_(" after 6 tries, last at "); put_dec(SYS_MHZ * 1000u / (2u * (sd.div + 1u)) / 1000u);
+		puts_(" after 6 tries, last at "); put_dec(SYS_MHZ / SD_PERIOD(sd.div));
 		puts_(" MHz (host status "); put_hex(sd_last_status, 2);
 		puts_(", card status "); put_hex(sd_last_r1, 8); puts_(")\n");
 		return 0;
@@ -746,7 +823,7 @@ COLD static int load_model(int k)
 		puts_("\n("); put_dec(fat_retries); puts_(" pieces read again");
 		if (fat_reinits) {
 			puts_(", the card initialised again "); put_dec(fat_reinits); puts_(" times; SD clock now ");
-			put_dec(SYS_MHZ * 1000u / (2u * (sd.div + 1u)) / 1000u); puts_(" MHz");
+			put_dec(SYS_MHZ / SD_PERIOD(sd.div)); puts_(" MHz");
 			sd_div = sd.div;
 		}
 		puts_(")");
@@ -805,34 +882,153 @@ static void put_tok(uint32_t prev, uint32_t tok)
 
 static uint32_t toks[600];         /* a 511-character line plus the chat template */
 static uint32_t max_new = 256;
+/* thinking (Qwen3's thinking mode): the model reasons between <think>
+ * and </think> before it answers; after think_budget tokens of it,
+ * </think> is put in for it so that an answer comes */
+static int think;
+static uint32_t think_budget = 256;
+static void toggle_think(void)
+{
+	think = !think;
+	puts_(think ? " (thinking on) " : " (thinking off) ");
+	ui_set_think(think);
+	if (model_ok) ui_ready();
+}
+
+/* Reading ahead: while the question is typed, the chat turn's tokens
+ * that can no longer change are stepped into the cache -- the
+ * template's start, then each word once the next has begun (a word and
+ * the space before it are encoded on their own, which is nearly always
+ * what the whole line's encoding gives). pf_tok[0..pf_n) are those
+ * tokens, the first pf_done of them in the cache from position pf_base
+ * on; pf_end is the line index a token's word ends at. At Enter,
+ * generate() encodes the line as ever and keeps the longest prefix that
+ * agrees (mlm_rewind forgets the rest), so the answer is exactly what
+ * it would be without any of this. */
+#define PF_MAX 128
+static uint32_t pf_tok[PF_MAX];
+static uint16_t pf_end[PF_MAX];
+static int pf_n, pf_done, pf_pre;
+static uint32_t pf_base;
+/* a pause in typing: the whole line as if Enter came now, the template's
+ * end too, all but its last token (pf_spec: where that starts, -1 none;
+ * it holds while the text and the thinking switch stay as they were) */
+static int pf_spec = -1, pf_spec_think;
+static uint32_t pf_spec_ver;
+#define PF_PAUSE ((uint64_t)SYS_MHZ * 400000u)   /* 0.4 s */
+static void pf_reset(void) { pf_n = pf_done = 0; pf_spec = -1; }
+static int typeahead = 1;               /* :a */
+static void prefill(void)
+{
+	const mlm_header_t *h = M.hdr;
+	if (!model_ok || !typeahead || !(h->flags & MLM_F_CHAT_QWEN)) return;
+	if (!pf_n && !ed.n) return;            /* nothing before the first key */
+	if (!pf_n) {
+		pf_base = M.pos;
+		pf_done = 0;
+		pf_tok[0] = h->im_start_id;
+		pf_n = pf_pre = 1 + mlm_encode(&M, "user\n", pf_tok + 1, 8);
+		for (int k = 0; k < pf_n; k++) pf_end[k] = 0;
+	}
+	char *b = ed.b;
+	int n = ed.n;
+	if (pf_spec >= 0) {
+		if (pf_spec_ver == ed_ver && pf_spec_think == think) goto step;
+		pf_n = pf_spec; pf_spec = -1;      /* typing went on: the guess goes */
+	}
+	/* the words still as they were: before the last space typed */
+	while (pf_n > pf_pre && !(pf_end[pf_n - 1] < n && b[pf_end[pf_n - 1]] == ' ')) pf_n--;
+	if (pf_done > pf_n) { mlm_rewind(&M, pf_base + (uint32_t)pf_n); pf_done = pf_n; }
+	if (n && b[0] != ':') {
+		/* the next finished word, if there is one */
+		int cov = pf_n > pf_pre ? pf_end[pf_n - 1] : 0, e = cov + 1;
+		while (e < n && b[e] != ' ') e++;
+		if (e < n && e - cov <= 40 && pf_n + 44 <= PF_MAX) {
+			/* (in toks: free until Enter; the stack is short) */
+			uint32_t *t = toks;
+			char *w = (char *)(toks + 64);
+			for (int i = 0; i < e - cov; i++) w[i] = b[cov + i];
+			w[e - cov] = 0;
+			int k = mlm_encode(&M, w, t, 44);
+			for (int i = 0; i < k; i++) { pf_tok[pf_n] = t[i]; pf_end[pf_n++] = (uint16_t)e; }
+			return;                        /* (the keys, before a step) */
+		}
+		/* a pause after all the finished words are in: the rest */
+		if (pf_done == pf_n && cycles() - ed_t > PF_PAUSE) {
+			b[n] = 0;
+			int k = chat_prompt(b, toks, 580), a = 0;
+			while (a < pf_n && a < k && pf_tok[a] == toks[a]) a++;
+			if (k - 1 <= PF_MAX && a >= pf_pre) {
+				pf_n = pf_spec = a;
+				pf_spec_ver = ed_ver; pf_spec_think = think;
+				while (pf_n < k - 1) { pf_tok[pf_n] = toks[pf_n]; pf_end[pf_n++] = (uint16_t)n; }
+				if (pf_done > pf_n) { mlm_rewind(&M, pf_base + (uint32_t)pf_n); pf_done = pf_n; }
+			}
+			ed_t = cycles();                /* (once a pause, if it does not fit) */
+		}
+	} else if (n) pf_n = pf_pre;           /* a command: only the template */
+step:
+	if (pf_done < pf_n && M.pos + 96 < M.ctx) {
+		BBOX->busy = 2; BBOX->pos = M.pos; BBOX->gen = 0; BBOX->ticks = 0;
+		mlm_step_ex(&M, pf_tok[pf_done], 0);
+		BBOX->busy = 0;
+		pf_done++;
+	}
+}
 static int verbose;
+
+/* a Qwen3 chat turn's tokens for line: the template around it, the
+ * reasoning block opened (thinking) or empty */
+static int chat_prompt(const char *line, uint32_t *t, int max)
+{
+	const mlm_header_t *h = M.hdr;
+	int n = 0;
+	t[n++] = h->im_start_id;
+	n += mlm_encode(&M, "user\n", t + n, max - n);
+	n += mlm_encode(&M, line, t + n, max - 12 - n);
+	t[n++] = h->im_end_id;
+	n += mlm_encode(&M, "\n", t + n, max - n);
+	t[n++] = h->im_start_id;
+	n += mlm_encode(&M, "assistant\n", t + n, max - n);
+	if (h->think_id != 0xffffffffu && think) {
+		/* thinking: the reasoning block opened for the model, with its
+		 * first words (MLM_THINK_PREFIX: Bonsai closes it at once
+		 * otherwise) */
+		t[n++] = h->think_id;
+		n += mlm_encode(&M, "\n" MLM_THINK_PREFIX, t + n, max - n);
+	} else if (h->think_id != 0xffffffffu) {
+		/* non-thinking: an empty reasoning block */
+		t[n++] = h->think_id;
+		n += mlm_encode(&M, "\n\n", t + n, max - n);
+		t[n++] = h->think_end_id;
+		n += mlm_encode(&M, "\n\n", t + n, max - n);
+	}
+	return n;
+}
 
 COLD static void generate(const char *line)
 {
 	col = wcols = wlen = 0;
 	const mlm_header_t *h = M.hdr;
 	int qwen = (h->flags & MLM_F_CHAT_QWEN) != 0;
-	int n = 0;
+	int n = 0, skip = 0;
 	if (!qwen) {
 		mlm_init(&M, ctx_len);          /* stories: each prompt starts over */
 		if (h->flags & MLM_F_BOS) toks[n++] = h->bos_id;
 		n += mlm_encode(&M, line, toks + n, 580 - n);
 	} else {
-		/* non-thinking Qwen3 chat turn; the conversation stays in the cache */
-		toks[n++] = h->im_start_id;
-		n += mlm_encode(&M, "user\n", toks + n, 580 - n);
-		n += mlm_encode(&M, line, toks + n, 580 - n);
-		toks[n++] = h->im_end_id;
-		n += mlm_encode(&M, "\n", toks + n, 580 - n);
-		toks[n++] = h->im_start_id;
-		n += mlm_encode(&M, "assistant\n", toks + n, 580 - n);
-		if (h->think_id != 0xffffffffu) {
-			toks[n++] = h->think_id;
-			n += mlm_encode(&M, "\n\n", toks + n, 580 - n);
-			toks[n++] = h->think_end_id;
-			n += mlm_encode(&M, "\n\n", toks + n, 580 - n);
+		/* a Qwen3 chat turn; the conversation stays in the cache */
+		n = chat_prompt(line, toks, 580);
+		/* what was read ahead and still agrees stays in the cache */
+		while (skip < pf_done && skip < n - 1 && pf_tok[skip] == toks[skip]) skip++;
+		if (skip < pf_done) mlm_rewind(&M, pf_base + (uint32_t)skip);
+		pf_reset();
+		uint32_t room = 32 + (think ? think_budget : 0);
+		if (M.pos - (uint32_t)skip + n + room > M.ctx) {
+			puts_("[context full: starting over]\n");
+			mlm_init(&M, ctx_len);
+			skip = 0;
 		}
-		if (M.pos + n + 32 > M.ctx) { puts_("[context full: starting over]\n"); mlm_init(&M, ctx_len); }
 	}
 	if (!n) return;
 	ui_user(line);
@@ -840,12 +1036,19 @@ COLD static void generate(const char *line)
 	eng_cycles_total = eng_waits_total = 0;
 	uint64_t t0 = cycles(), t_first = 0;
 	int full = 0;
-	uint32_t tok = toks[0], prev = h->bos_id, gen = 0;
+	uint32_t tok = toks[skip], prev = h->bos_id, gen = 0;
+	int thinking = 0, think_open = qwen && think && h->think_id != 0xffffffffu;
+	uint32_t thought = 0;
 	if (!qwen) put_tok(prev, tok);
 	/* a chat turn's prompt is not printed: show that it is being read */
 	if (qwen) { puts_("(reading "); put_dec((uint32_t)n); puts_(" tokens) "); }
 	BBOX->busy = 1; BBOX->ticks = 0;
-	for (int i = 0; ; i++) {
+	watch_esc = 1; esc_seen = 0;
+#ifndef SIM
+	M.rng ^= entropy;                   /* (the testbench samples greedily anyway) */
+	if (!M.rng) M.rng = 1;
+#endif
+	for (int i = skip; ; i++) {
 		BBOX->pos = M.pos; BBOX->gen = gen;
 		uint64_t s0 = cycles();
 		uint64_t e0 = eng_cycles_total;
@@ -858,9 +1061,10 @@ COLD static void generate(const char *line)
 		if (verbose) {
 			uint32_t dt = (uint32_t)(cycles() - s0), de = (uint32_t)ENG_CPU(eng_cycles_total - e0);
 			puts_("{"); put_dec(M.pos - 1); puts_(": "); put_dec(dt / 1000); puts_(" kcyc, engine ");
-			put_dec(de / 1000); puts_(" kcyc}");
+			put_dec(de / 1000); puts_(" kcyc, stack used "); put_dec(stack_size() - stack_free()); puts_(" of "); put_dec(stack_size()); puts_(" B}");
+			puts_("\n");
 #ifdef MLM_PROFILE
-			puts_("\n"); prof_report();
+			prof_report();
 #endif
 		}
 		uint32_t next;
@@ -869,13 +1073,47 @@ COLD static void generate(const char *line)
 			if (!qwen) put_tok(tok, next);
 		} else {
 			if (!t_first) t_first = cycles() - t0;
-			next = mlm_sample(&M);
+			if (think_open) {
+				/* the prompt opened the reasoning: show it as such */
+				think_open = 0;
+				thinking = 1;
+				text_end(); puts_("(thinking) " MLM_THINK_PREFIX);
+				ui_think_begin();
+				for (const char *p = MLM_THINK_PREFIX; *p; p++) ui_out((uint8_t)*p);
+				ui_status("Thinking...    Esc: stop");
+			}
+			/* out of thinking budget: close the reasoning for it */
+			if (thinking && thought >= think_budget) next = h->think_end_id;
+			else next = mlm_sample(&M);
 			if (next == h->eos_id || next == h->eos2_id || next == h->im_end_id) {
 				if (qwen) { mlm_step_ex(&M, next, 0); }   /* keep <|im_end|> in the cache */
 				break;
 			}
-			put_tok(tok, next);
-			if (++gen >= max_new) break;
+			if (next == h->think_id && !thinking) {
+				thinking = 1;
+				text_end(); puts_("(thinking) ");
+				ui_think_begin();
+				ui_status("Thinking...    Esc: stop");
+			} else if (next == h->think_end_id && thinking) {
+				thinking = 0;
+				text_end(); puts_("\n(answer) ");
+				ui_think_end();
+				ui_status("Writing...    Esc: stop");
+			} else {
+				put_tok(tok, next);
+				if (thinking) {
+					if (++thought % 8 == 0) {
+						char st[40] = "Thinking... ", *p = st + 12;
+						uint32_t v = thought, d = 1;
+						while (v / d >= 10) d *= 10;
+						for (; d; d /= 10) *p++ = (char)('0' + v / d % 10);
+						const char *e = "    Esc: stop";
+						while (*e) *p++ = *e++;
+						*p = 0;
+						ui_status(st);
+					}
+				} else if (++gen >= max_new) break;
+			}
 		}
 		prev = tok;
 		tok = next;
@@ -884,9 +1122,11 @@ COLD static void generate(const char *line)
 			uint32_t c = UART_DATA & 0xff;
 			if (c != '\n') { text_end(); puts_(" [stopped]"); break; }
 		}
-		if (ui_key() == 27) { text_end(); puts_(" [stopped]"); break; }
+		if (esc_seen || ui_key() == 27) { text_end(); puts_(" [stopped]"); break; }
 	}
+	watch_esc = 0;
 	BBOX->busy = 0;
+	if (thinking) ui_think_end();
 	text_end();
 	ui_answer_end();
 	if (full) ui_status("The conversation is full: press F1 to start a new one");
@@ -907,7 +1147,7 @@ static uint32_t atou(const char *s) { uint32_t v = 0; while (*s >= '0' && *s <= 
 static void help(void)
 {
 	puts_(":models  :load N  :ctx N  :temp T (x100, 0 = greedy)  :n N (max new tokens)\n"
-	      ":reset (forget the conversation)  :bw (bandwidth)  :gap N (DDR3 fallback)  :v (timing per token)\n:s (engine self-test)  :sd (card again, after re-inserting it)  :rd N (dump card sector N)  :sdclk N (SD clock = 24/(N+1) MHz)  :w N (wrap at N columns, 0 = off)\n:o / :g / :u / :k (engine overlap / GLU unit / vector unit / read line on-off, for debugging)  :help\n");
+	      ":reset (forget the conversation)  :bw (bandwidth)  :gap N (DDR3 fallback)  :v (timing per token)\n:s (engine self-test)  :sd (card again, after re-inserting it)  :rd N (dump card sector N)  :sdclk N (SD clock = CPU/(2(N+1)); +128: CPU/(2N+1))  :w N (wrap at N columns, 0 = off)\n:o / :g / :u / :k / :a (engine overlap / GLU unit / vector unit / read line / type-ahead on-off, for debugging)  :quit (back to machboot)  :think [N] (reasoning before answering, N tokens at most)  :help\n");
 }
 
 /* sector n of the card: the read's result and its first 64 bytes plus
@@ -941,8 +1181,8 @@ COLD static void card_setup(void)
 		      "   take it out, put it back, and type :sd)\n");
 		return;
 	}
-	puts_("sd card: ok, "); puts_(sd.ccs ? "SDHC" : "SDSC"); puts_(", 4-bit, ");
-	put_dec(SYS_MHZ * 1000u / (2u * (sd_div + 1u)) / 1000u); puts_(" MHz\n");
+	puts_("sd card: ok, "); puts_(sd.ccs ? "SDHC" : "SDSC"); puts_(sd.wide ? ", 4-bit, " : ", 1-bit, ");
+	put_dec(SYS_MHZ / SD_PERIOD(sd_div)); puts_(" MHz\n");
 	/* the first FAT partition with models on it (a card can carry
 	 * machboot's partition first) */
 	int part;
@@ -983,7 +1223,8 @@ static void bbox_report(void)
 	BBOX->boots++;
 	puts_("(restart "); put_dec(BBOX->boots); puts_(" without reloading the FPGA");
 	if (BBOX->busy) {
-		puts_("; it stopped while generating: position "); put_dec(BBOX->pos);
+		puts_(BBOX->busy == 2 ? "; it stopped while reading ahead (type-ahead, :a turns it off): position "
+		                      : "; it stopped while generating: position "); put_dec(BBOX->pos);
 		puts_(", token "); put_dec(BBOX->gen); puts_(" of the answer, section "); put_dec(BBOX->sec);
 		puts_(", step "); put_dec(BBOX->ticks);
 	}
@@ -991,9 +1232,27 @@ static void bbox_report(void)
 	BBOX->busy = 0;
 }
 
+/* the stack, painted at the start: how much of it was never used */
+extern uint32_t _bss_end[];
+COLD static void stack_paint(void)
+{
+	uint32_t *p = _bss_end, *sp;
+	__asm__ volatile ("mv %0, sp" : "=r"(sp));
+	while (p < sp - 16) *p++ = 0x57ac57acu;
+}
+static uint32_t stack_free(void)
+{
+	uint32_t *p = _bss_end;
+	while (*p == 0x57ac57acu) p++;
+	return (uint32_t)((uint8_t *)p - (uint8_t *)_bss_end);
+}
+extern uint32_t _stack_top[];
+static uint32_t stack_size(void) { return (uint32_t)((uint8_t *)_stack_top - (uint8_t *)_bss_end); }
+
 COLD int main(void)
 {
 	static char line[512];
+	stack_paint();
 	LED = 1;
 #ifdef SIM
 	UART_DIV = SIM_UART_DIV;        /* the testbench decodes the line at this rate */
@@ -1041,8 +1300,26 @@ COLD int main(void)
 	if (model_ok) ui_ready();
 	else ui_status("No model found: please put BONSAI.MLM on the SD card and restart");
 	for (;;) {
+		if (stack_free() < 256) {
+			puts_("[warning: the stack came within "); put_dec(stack_free());
+			puts_(" bytes of the variables below it]\n");
+		}
 		puts_(model_ok ? "> " : "(no model) > ");
-		if (readline(line, sizeof(line)) < 0) {
+		int rl = readline(line, sizeof(line));
+		/* anything but a question: what was read ahead goes */
+		if ((rl < 0 || line[0] == ':' || !line[0]) && pf_done) mlm_rewind(&M, pf_base);
+		if (rl < 0 || line[0] == ':' || !line[0]) pf_reset();
+		if (rl == -2) {
+			/* F10: exit, once confirmed on the keyboard */
+			ui_status("Exit to machboot?    Enter: yes    Esc: no");
+			int c;
+			while ((c = ui_key()) < 0) ;
+			if (c == '\n') to_machboot();
+			if (model_ok) ui_ready();
+			else ui_status("No model found: please put BONSAI.MLM on the SD card and restart");
+			continue;
+		}
+		if (rl < 0) {
 			/* F1: a new conversation */
 			if (model_ok) mlm_init(&M, ctx_len);
 			puts_("(new conversation)\n");
@@ -1062,12 +1339,22 @@ COLD int main(void)
 			} else if (line[1] == 'c') {
 				ctx_len = atou(a);
 				if (model_ok) { mlm_init(&M, ctx_len); puts_("context "); put_dec(M.ctx); puts_("\n"); }
-			} else if (line[1] == 't') {
+			} else if (line[1] == 't' && line[2] != 'h') {
 				M.temp_q8 = atou(a) * 256 / 100;
 			} else if (line[1] == 'n') {
 				max_new = atou(a);
 			} else if (line[1] == 'r' && line[2] != 'd') {
 				if (model_ok) mlm_init(&M, ctx_len);
+			} else if (line[1] == 't' && line[2] == 'h') {
+				/* :think, or :think N (on, N tokens of reasoning at most) */
+				uint32_t b = atou(a);
+				if (b) { think = 1; think_budget = b; } else think = !think;
+				ui_set_think(think);
+				puts_(think ? "thinking on, up to " : "thinking off\n");
+				if (think) { put_dec(think_budget); puts_(" tokens\n"); }
+				if (model_ok) ui_ready();
+			} else if (line[1] == 'q') {
+				to_machboot();
 			} else if (line[1] == 'b') {
 				bwtest(32);
 			} else if (line[1] == 'o') {
@@ -1083,7 +1370,7 @@ COLD int main(void)
 				const char *a = line + 6;          /* :sdclk N */
 				while (*a == ' ') a++;
 				sd_div = atou(a);
-				puts_("sd data clock "); put_dec(SYS_MHZ * 1000u / (2u * (sd_div + 1u)) / 1000u);
+				puts_("sd data clock "); put_dec(SYS_MHZ / SD_PERIOD(sd_div));
 				puts_(" MHz (from the next :sd or :load)\n");
 				sd.div = sd_div;
 				plat_sd_wr(0, sd_div);
@@ -1098,6 +1385,9 @@ COLD int main(void)
 				puts_(mlm_vu ? "vector loops in the vector unit\n" : "vector loops on the CPU\n");
 			} else if (line[1] == 'e' && !line[2]) {
 				engdiag();
+			} else if (line[1] == 'a' && !line[2]) {
+				typeahead = !typeahead;
+				puts_(typeahead ? "type-ahead on\n" : "type-ahead off\n");
 			} else if (line[1] == 'k') {
 				SYS_LINE = !(SYS_LINE & 1);
 				puts_((SYS_LINE & 1) ? "read line on\n" : "read line off (or not in this bitstream)\n");

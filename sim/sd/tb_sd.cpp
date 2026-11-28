@@ -83,7 +83,8 @@ int main(int argc, char **argv)
 	while (!top->init_done) tick();
 
 	sd_t sd; fat_t fat;
-	int rc = sd_init(&sd, 0);
+	/* TB_SD_DIV: the data clock divider (0x81: three cycles a period) */
+	int rc = sd_init(&sd, getenv("TB_SD_DIV") ? strtoul(getenv("TB_SD_DIV"), 0, 0) : 0);
 	fprintf(stderr, "sd_init %d: ccs %d rca %04x wide %d, %llu cycles\n", rc, sd.ccs, sd.rca, sd.wide,
 	        (unsigned long long)cycles);
 	if (rc) return 1;

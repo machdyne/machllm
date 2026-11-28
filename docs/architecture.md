@@ -3,13 +3,13 @@
 ![machllm architecture](img/architecture.svg)
 
 ```
- CLK_48 -> PLL: DDR3 edge clock 180 MHz, memory side 90 MHz, CPU 49.09 MHz
+ CLK_48 -> PLL: DDR3 edge clock 180 MHz, memory side 90 MHz, CPU 54 MHz
 
- CPU side (49 MHz)                         memory side (90 MHz)
+ CPU side (54 MHz)                         memory side (90 MHz)
  zeitlos32ps --+-- RAM 96 KB ====== second port ======+-- ENGINE: copy-out, packer
  (RV32IM)      |   (vector unit)                      +-- DMA unit: stream reads,
                +-- SYSCTL                             |   block writes, byte stores
-               +-- UART (1M 8N1)                      |
+               +-- UART (1M 8N1, 2 KB receive FIFO)   |
                +-- vector unit                        +-- ENGINE + GLU unit -- sq/sd: stream ----+
                +-- screen + keyboard                  +-- SD host (4-bit) --- wq: block writes --+--> mlm_ddr3
                |   (25.2 / 126 / 12 MHz)              +-- DDR3 registers (training)              |   (controller
@@ -26,7 +26,7 @@ RAM, its packer reads the int32 vector it MX-packs into the engine's
 input from the RAM, and the DMA unit (`rtl/mlm_dma.v`) streams main
 memory into the RAM (cache scales, norm weights, RoPE rows, layer
 descriptors) and writes the KV cache from it. The CPU only starts them
-and waits. Builds: `make MEM_MHZ=90` (DDR3 at 180, CPU 49.09: the fast
+and waits. Builds: `make MEM_MHZ=90` (DDR3 at 180, CPU 54: the fast
 build), `make MEM_MHZ=75` (DDR3 at 150, CPU 50), plain `make` (one
 domain, 48 MHz). See [usage.md](usage.md).
 
@@ -70,13 +70,16 @@ answers (~20 CPU cycles across the crossing).
 
 | | Used | Of | |
 |---|---|---|---|
-| LUT4 (TRELLIS_COMB) | 34,589 | 43,848 | 78% |
-| flip-flops (TRELLIS_FF) | 16,807 | 43,848 | 38% |
-| block RAM (DP16KD) | 100 | 108 | 92% |
+| LUT4 (TRELLIS_COMB) | 34,546 | 43,848 | 78% |
+| flip-flops (TRELLIS_FF) | 16,852 | 43,848 | 38% |
+| block RAM (DP16KD) | 101 | 108 | 93% |
 | multipliers (MULT18X18D) | 39 | 72 | 54% |
 
-Timing (seed 6): memory side 90.7 MHz (90.0 needed), CPU 52.9 (49.1),
-pixel clock 55.7 (25.2).
+Timing (seed 3): memory side 93.0 MHz (90.0 needed), CPU 57.6 (54.0),
+pixel clock 58.1 (25.2). The CPU at 60 (540 / 9) reaches 57.6: its
+slowest path is a load from the RAM's block-RAM output through the
+CPU's late result into write-back, and the fix (a load answered a cycle
+later) costs about as many cycles as 60 MHz gains.
 
 Block RAM: firmware RAM 48 (both of its ports used: the CPU's and the
 memory side's), the engine's output memory, input memory (16 narrow

@@ -32,9 +32,13 @@ Two engines, driven by the CPU:
   them for the DDR3 controller's block-write port. The clock stops while
   the queue is full (the card waits).
 
-SCK = 48 MHz / (2 (DIV + 1)): 400 kHz for identification, 24 MHz for
-data. The host changes CMD after a falling edge and samples at rising
-edges (default-speed mode).
+SCK = the CPU's clock / (2 (DIV + 1)): 400 kHz for identification, and
+for data the fastest at most 25 MHz (default speed). DIV bit 7 makes the
+high half one cycle shorter, for odd periods: 2 DIV + 1 cycles (with the
+CPU at 54 MHz, three cycles: 18 MHz; 24 MHz at 48). The low half stays
+the long one: the card's output (at most 14 ns after the falling edge)
+settles in it, and the host changes CMD after a falling edge and samples
+at rising edges (default-speed mode).
 
 Registers (0x7200_0000, word offsets): 0 DIV, 1 ARG, 2 CMD (start:
 index, response type, busy, no-CRC), 3 STATUS, 4-7 RESP, 8 DADDR,
@@ -44,7 +48,7 @@ high).
 ## The driver
 
 `sd_init()`: 80 idle clocks, CMD0, CMD8, ACMD41 until ready (SDHC when
-CCS), CMD2, CMD3, CMD7, ACMD6 (4-bit), CMD16 for SDSC, then 24 MHz.
+CCS), CMD2, CMD3, CMD7, ACMD6 (4-bit), CMD16 for SDSC, then the data clock.
 `sd_read()`: CMD17 or CMD18 + CMD12 per run of up to 65535 blocks.
 `fat_mount()` finds the first FAT partition (or a superfloppy),
 `fat_list()` walks the root directory (8.3 names), `fat_load()` follows
@@ -60,11 +64,14 @@ ways, R1b busy after the response) with a FAT32 image made by
 | | |
 |---|---|
 | 2.2 MB file through the SD host and the DDR3 block-write port (sim/sd) | 11.67 MB/s, file intact |
+| the same with the three-cycle period (`TB_SD_DIV=0x81`) | 13.6M cycles: 8.8 MB/s at 54 MHz |
 | 2.5 MB model loaded by the firmware in the whole-SOC simulation | 10.75 MB/s |
 
 On the board (90 MHz build, 24 MHz SD clock): Bonsai's 246 MB load in
 about 21 s, 11.9 MB/s. If reads fail, the firmware retries the piece
-and drops the SD clock (to 12 MHz); one 75 MHz build did so.
+and drops the SD clock (a three-cycle period goes to four, then
+longer); one 75 MHz build did so. With the CPU at 54 MHz the SD clock is
+18 MHz: Bonsai's 230 MB image loads in 26.4 s (8.7 MB/s, measured).
 
 ## Not done yet
 
